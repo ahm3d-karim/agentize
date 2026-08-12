@@ -487,5 +487,87 @@ class TestQuickStack(unittest.TestCase):
             self.assertLessEqual(len(agentize.walk_repo(root)), agentize.MAX_WALK_FILES)
 
 
+class TestHistoryAndBootstrap(unittest.TestCase):
+    """Commit-history context (git_recent) + first-run bootstrap consent."""
+
+    def _make_git_repo(self, commits):
+        """commits: [(iso_date, author, subject)] → temp repo path."""
+        d = pathlib.Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", "-q", str(d)], check=True)
+        subprocess.run(["git", "-C", str(d), "config", "user.name", "T"], check=True)
+        subprocess.run(["git", "-C", str(d), "config", "user.email", "t@e.x"], check=True)
+        for date, author, msg in commits:
+            (d / "f.txt").write_text(msg, encoding="utf-8")
+            env = {**os.environ,
+                   "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date,
+                   "GIT_AUTHOR_NAME": author, "GIT_COMMITTER_NAME": author}
+            subprocess.run(["git", "-C", str(d), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(d), "commit", "-q", "-m", msg],
+                           check=True, env=env)
+        return d
+
+    def test_git_recent_window_and_authors(self):
+        from datetime import datetime, timedelta
+        day = datetime.now().strftime("%Y-%m-%dT12:00:00")
+        old = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%dT12:00:00")
+        d = self._make_git_repo([
+            (old, "Alice", "old work"),
+            (day, "Alice", "fresh fix"),
+            (day, "Bob", "another one"),
+        ])
+        recent = agentize.git_recent(d, "yesterday")
+        self.assertEqual([c[2] for c in recent], ["another one", "fresh fix"])
+        alice = agentize.git_recent(d, "yesterday", ["Alice"])
+        self.assertEqual([c[2] for c in alice], ["fresh fix"])
+        self.assertEqual(len(agentize.git_recent(d, "yesterday", ["Nobody"])), 0)
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+    def test_git_recent_not_a_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(agentize.git_recent(pathlib.Path(d)), [])
+
+    def test_render_recent_section(self):
+        with tempfile.TemporaryDirectory() as d:
+            ev = agentize.analyze(materialize("fixture_ml", pathlib.Path(d)))
+            ev["recent"] = ("yesterday", [("2026-08-11", "Alice", "fix the thing")])
+            md = agentize.render(ev)
+        self.assertIn("## Recent activity (since yesterday)", md)
+        self.assertIn("2026-08-11 · Alice — fix the thing", md)
+
+    def test_bootstrap_consent_declined_runs_nothing(self):
+        import shutil as _sh
+        orig_which, orig_run = agentize.shutil.which, agentize.subprocess.run
+        orig_cfg = agentize.CONFIG_PATH
+        calls = []
+        agentize.shutil.which = lambda _c: None  # pretend everything missing
+        agentize.subprocess.run = lambda *a, **k: calls.append(a) or None
+        agentize.CONFIG_PATH = pathlib.Path(tempfile.mkdtemp()) / "cfg.json"
+        old_input = builtins.input
+        try:
+            builtins.input = lambda prompt="": "n"  # decline all installs
+            agentize.bootstrap(interactive=True)
+            self.assertEqual(calls, [])  # no install command may run
+            self.assertTrue(agentize.load_config().get("first_run_done"))
+            agentize.bootstrap(interactive=True)  # second call: no-op
+            self.assertEqual(calls, [])
+        finally:
+            agentize.shutil.which, agentize.subprocess.run = orig_which, orig_run
+            agentize.CONFIG_PATH = orig_cfg
+            builtins.input = old_input
+
+    def test_ask_history_defaults(self):
+        old_input = builtins.input
+        try:
+            builtins.input = lambda prompt="": ""
+            self.assertEqual(agentize.ask_history_defaults(), ("yesterday", None))
+            answers = iter(["3d", "Alice, Bob"])
+            builtins.input = lambda prompt="": next(answers)
+            self.assertEqual(agentize.ask_history_defaults(),
+                             ("3d", ["Alice", "Bob"]))
+        finally:
+            builtins.input = old_input
+
+
 if __name__ == "__main__":
     unittest.main()

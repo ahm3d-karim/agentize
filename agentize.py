@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 
 # --------------------------------------------------------------------------
 # terminal styling — zero-dep ANSI; inert when piped or NO_COLOR
@@ -651,6 +651,18 @@ def render(ev: dict) -> str:
             L.append(f"- {c}")
         L.append("")
 
+    # ---- recent activity (commit history context, optional)
+    if ev.get("recent") is not None:
+        since, commits = ev["recent"]
+        L.append(f"## Recent activity (since {since})")
+        L.append("")
+        if commits:
+            for d, a, s in commits:
+                L.append(f"- {d} · {a} — {s[:90]}")
+        else:
+            L.append(f"- No commits since {since}.")
+        L.append("")
+
     # ---- evidence table
     if ev.get("commands"):
         L.append("## Command reference (sources)")
@@ -1149,7 +1161,9 @@ def find_open_pr(token: str, full_name: str, head: str) -> dict | None:
         return None
 
 
-def generate_in_clone(repo: dict, token: str, me: str, dry_run: bool) -> str:
+def generate_in_clone(repo: dict, token: str, me: str, dry_run: bool,
+                      since: str = "yesterday",
+                      authors: list[str] | None = None) -> str:
     """Clone repo, generate AGENTS.md, optionally push a branch + open PR.
     Returns a status string for the summary. Never raises."""
     name = repo["full_name"]
@@ -1165,7 +1179,9 @@ def generate_in_clone(repo: dict, token: str, me: str, dry_run: bool) -> str:
         md_path = work / "AGENTS.md"
         if md_path.exists():
             return f"{name}: already has AGENTS.md — skipped"
-        md_path.write_text(render(analyze(work)) + "\n", encoding="utf-8")
+        ev = analyze(work)
+        ev["recent"] = (since, git_recent(work, since, authors))
+        md_path.write_text(render(ev) + "\n", encoding="utf-8")
         print("  " + ok(f"{name}: AGENTS.md generated ({md_path.stat().st_size} bytes)"))
         if dry_run:
             return f"{name}: generated (dry-run, nothing pushed)"
@@ -1264,10 +1280,16 @@ def github_mode(args) -> int:
     if not targets:
         print("agentize: no repos selected", file=sys.stderr)
         return 1
+    since = getattr(args, "since", None)
+    authors = getattr(args, "authors", None)
+    if sys.stdin.isatty() and since is None:
+        since, authors = ask_history_defaults()
+    since = since or "yesterday"
     print(f"\nProcessing {len(targets)} repo(s)...")
     results: list[str] = [""] * len(targets)
     with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {ex.submit(generate_in_clone, r, token, me, args.dry_run): i
+        futs = {ex.submit(generate_in_clone, r, token, me, args.dry_run,
+                          since, authors): i
                 for i, r in enumerate(targets)}
         for fut in as_completed(futs):
             i = futs[fut]
@@ -1301,6 +1323,8 @@ Usage:
   agentize [PATH] --claude     also write CLAUDE.md
   agentize [PATH] --cursor     also write .cursorrules
   agentize [PATH] --force      overwrite an existing AGENTS.md
+  agentize [PATH] --since 3d   include commit history (git ref, default yesterday)
+  agentize [PATH] --authors a,b
   agentize --json              dump extracted evidence as JSON
   agentize --llm               polish with an LLM (bring your own key)
   agentize --llm --provider openai --model gpt-4o-mini
@@ -1316,6 +1340,103 @@ stored in ~/.agentize.json, or set the provider's env var (ANTHROPIC_API_KEY,
 OPENAI_API_KEY, ...). Without --llm, agentize is fully offline and never
 calls a model.
 """
+
+FIRST_RUN_FLAG = "first_run_done"
+
+
+def git_recent(root: Path, since: str = "yesterday",
+               authors: list[str] | None = None, cap: int = 15) -> list[tuple]:
+    """Commit subjects since a git date ref, optionally filtered by authors.
+    Returns [(date, author, subject)] — never raises."""
+    try:
+        cmd = ["git", "-C", str(root), "log", "--since=" + since,
+               "--pretty=format:%ad|%an|%s", "--date=short", "-n", "200"]
+        if authors:
+            cmd += [f"--author={a}" for a in authors]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+        return [tuple(l.split("|", 2)) for l in out.splitlines() if "|" in l][:cap]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def tool_status() -> list[tuple[str, str | None, str]]:
+    """(name, found path or None, install hint) for python/uv/gh."""
+    return [
+        ("Python", shutil.which("python") or shutil.which("python3"),
+         "winget install -e --id Python.Python.3.12"),
+        ("uv", shutil.which("uv"),
+         'powershell -c "irm https://astral.sh/uv/install.ps1 | iex"'),
+        ("gh", shutil.which("gh"),
+         "winget install -e --id GitHub.cli"),
+    ]
+
+
+def bootstrap(interactive: bool) -> None:
+    """First-run setup: check Python/uv/gh, install missing ones with consent.
+    Never runs anything without an explicit yes. Runs once (first_run flag)."""
+    cfg = load_config()
+    if cfg.get(FIRST_RUN_FLAG):
+        return
+    print("\n  First-run setup:")
+    for name, path, hint in tool_status():
+        if path:
+            print(f"    ok {name}: {path}")
+        elif interactive:
+            try:
+                ans = input(f"    {name} not found. Install it now? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans == "y":
+                print(f"    installing {name}...")
+                subprocess.run(hint, shell=True, check=False)
+            else:
+                print(f"    skipped — later: {hint}")
+        else:
+            print(f"    missing {name} — install with: {hint}")
+    if sys.version_info < (3, 11) and interactive:
+        try:
+            ans = input("    Python too old (need 3.11+). Install 3.12 via uv? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans == "y" and shutil.which("uv"):
+            subprocess.run(["uv", "python", "install", "3.12"], check=False)
+    save_config({**cfg, FIRST_RUN_FLAG: True})
+
+
+def signin_github() -> str | None:
+    """Interactive sign-in: gh device flow first, token paste as fallback."""
+    if shutil.which("gh"):
+        print("  Signing in with GitHub CLI (device flow) — a code will appear;")
+        print("  enter it at https://github.com/login/device, then return here.")
+        subprocess.run(["gh", "auth", "login"], check=False)
+        token = gh_token()
+        if token:
+            save_config({**load_config(), "github_token": token})
+            return token
+    try:
+        token = input("  Paste a GitHub token (scope: repo): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not token:
+        return None
+    try:
+        api_call(token, "/user")
+    except GitHubError:
+        print("  invalid token")
+        return None
+    save_config({**load_config(), "github_token": token})
+    return token
+
+
+def ask_history_defaults() -> tuple[str, list[str] | None]:
+    """Interactive: commit window (default yesterday) and authors (default all)."""
+    try:
+        since = input("  Commits since? [yesterday] ").strip() or "yesterday"
+        raw = input("  Authors? [all, comma-separated] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return "yesterday", None
+    authors = [a.strip() for a in raw.split(",") if a.strip()] or None
+    return since, authors
 
 
 def write_agents_md(root: Path, md: str) -> bool:
@@ -1340,7 +1461,11 @@ def menu_local_generate() -> int:
     root = Path.cwd().resolve()
     print(dim(f"Scanning {root.name}…"), file=sys.stderr)
     t0 = time.monotonic()
-    md = render(analyze(root))
+    ev = analyze(root)
+    if (root / ".git").exists():
+        since, authors = ask_history_defaults()
+        ev["recent"] = (since, git_recent(root, since, authors))
+    md = render(ev)
     if write_agents_md(root, md):
         print(ok(f"Done — {time.monotonic() - t0:.1f}s"))
     return 0
@@ -1415,6 +1540,7 @@ def menu_ai_polish() -> int:
 
 def interactive_menu() -> int:
     """Bare `agentize`: a small TUI — local generate, GitHub mode, help."""
+    bootstrap(interactive=True)
     gh = gh_token() or os.environ.get("GITHUB_TOKEN") or load_config().get("github_token")
     cwd = Path.cwd().resolve()
     ctx = quick_stack(cwd)  # computed ONCE — no per-keystroke repo walk
@@ -1441,7 +1567,8 @@ def interactive_menu() -> int:
             return menu_local_generate()
         if choice == "2":
             return github_mode(argparse.Namespace(
-                repos=None, dry_run=False, notify="none"))
+                repos=None, dry_run=False, notify="none",
+                since=None, authors=None))
         if choice == "3":
             print("\n" + HELP_TEXT)
             continue
@@ -1489,6 +1616,11 @@ def main() -> int:
     ap.add_argument("--model", metavar="NAME", help="LLM model override")
     ap.add_argument("--base-url", metavar="URL",
                     help="custom OpenAI-compatible base URL (with --provider custom)")
+    ap.add_argument("--since", metavar="REF",
+                    help="include commit history in AGENTS.md (git date ref, "
+                         "e.g. yesterday, 3d, 2026-08-01)")
+    ap.add_argument("--authors", metavar="NAMES",
+                    help="commit authors to include with --since (comma-separated)")
     ap.add_argument("--version", action="version", version=f"agentize {VERSION}")
     args = ap.parse_args()
 
@@ -1508,6 +1640,9 @@ def main() -> int:
         provider = args.provider or choose_provider()
         if provider != "none":
             ev = polish(ev, provider, args.model, args.base_url)
+
+    if args.since:
+        ev["recent"] = (args.since, git_recent(root, args.since, args.authors))
 
     md = render(ev)
 

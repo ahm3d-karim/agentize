@@ -70,7 +70,25 @@ Then open the generated AGENTS.md, sanity-check the commands, commit it. Done.
 Verify the install worked with:
 
 ```bash
-agentize --version   # → agentize 0.2.1
+agentize --version   # → agentize 0.6.0
+```
+
+## First run
+
+The first time you open the menu, agentize checks your setup (Python, uv, gh)
+and offers to install anything missing — **only after you say yes**. Nothing
+is installed or connected by default. GitHub sign-in is also opt-in: pick
+GitHub mode and it offers `gh auth login` (device flow) or a token paste.
+
+## Commit history context
+
+When generating for a git repo, agentize can include a "Recent activity"
+section so agents know what's in flight. Interactive mode asks (defaults:
+since **yesterday**, authors **all**); non-interactive uses flags:
+
+```bash
+agentize . --since 7d                # commits from the last 7 days
+agentize . --since yesterday --authors "Alice, Bob"
 ```
 
 ## GitHub mode: AGENTS.md as pull requests
