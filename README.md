@@ -93,6 +93,28 @@ never appear in URLs or git config.
 
 AI coding agents read `AGENTS.md` to learn a project's commands and conventions — but most generated ones hallucinate. agentize extracts commands from `package.json` scripts, `pyproject.toml`, `Makefile` targets, and CI workflow `run:` steps, then annotates each with its source so you can audit every line before committing.
 
+## AI polish (bring your own key)
+
+agentize itself never calls a model — every command is extracted from real
+files. But you can optionally polish the prose with your own LLM key
+(OpenAI-compatible endpoints, key stored locally in `~/.agentize.json`):
+
+```bash
+agentize --llm                        # interactive provider picker
+agentize --llm --provider openai      # skip the picker
+agentize --llm --provider openrouter --model anthropic/claude-sonnet-4
+agentize --llm --provider custom --base-url http://localhost:11434/v1 --model llama3.2
+```
+
+Providers: anthropic, openai, openrouter, gemini, xai, deepseek, groq,
+mistral, ollama (local, no key), custom. Keys come from the provider's env
+var (e.g. `ANTHROPIC_API_KEY`) or a one-time prompt — they never leave your
+machine except to the provider's own API.
+
+The model writes only an Overview paragraph from the extracted evidence —
+**commands and structure stay 100% evidence-based; the model is forbidden
+from inventing anything.** The interactive menu has it as option 4.
+
 ## What it extracts
 
 | Signal | Source |

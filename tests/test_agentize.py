@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -311,6 +313,100 @@ class TestAgentsMdMarkers(unittest.TestCase):
         self.assertIn("has AGENTS.md", hasit_line)
         self.assertNotIn("has AGENTS.md",
                          next(l for l in out.splitlines() if "me/lacks" in l))
+
+
+class TestLlmPolish(unittest.TestCase):
+    """BYOK LLM mode: provider table, prompt rules, offline default."""
+
+    def setUp(self):
+        self._orig_cfg = agentize.CONFIG_PATH
+        import tempfile as _tf
+        self._cfg_dir = _tf.TemporaryDirectory()
+        agentize.CONFIG_PATH = pathlib.Path(self._cfg_dir.name) / "cfg.json"
+
+    def tearDown(self):
+        agentize.CONFIG_PATH = self._orig_cfg
+        self._cfg_dir.cleanup()
+
+    def test_providers_table_complete(self):
+        for key, p in agentize.PROVIDERS.items():
+            self.assertIn("name", p)
+            if key != "custom":
+                self.assertTrue(p["base_url"], key)
+                self.assertTrue(p["model"], key)
+        self.assertIsNone(agentize.PROVIDERS["ollama"]["key_env"])
+        self.assertIsNone(agentize.PROVIDERS["custom"]["base_url"])
+
+    def test_polish_prompt_forbids_invention(self):
+        prompt = agentize.build_polish_prompt({"name": "x", "commands": []})
+        self.assertIn("Never invent", prompt)
+        self.assertIn("Evidence JSON", prompt)
+        self.assertIn("REAL config files", prompt)
+
+    def test_render_prefers_ai_overview(self):
+        ev = {"name": "x", "stack": {"languages": ["Python"], "frameworks": [],
+              "pm": None, "test": [], "linters": [], "ts_strict": False},
+              "roles": {}, "description": "readme says this",
+              "ai_overview": "the model says this", "commands": []}
+        md = agentize.render(ev)
+        self.assertIn("the model says this", md)
+        self.assertNotIn("readme says this", md)
+
+    def test_polish_offline_default(self):
+        ev = {"name": "x"}
+        self.assertIs(agentize.polish(ev, "none", None, None), ev)
+        self.assertIs(agentize.polish(ev, None, None, None), ev)
+
+    def test_choose_provider_by_number(self):
+        real_input = builtins.input
+        builtins.input = lambda *a, **k: "2"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(agentize.choose_provider(), "openai")
+        finally:
+            builtins.input = real_input
+
+    def test_choose_provider_skip(self):
+        real_input = builtins.input
+        builtins.input = lambda *a, **k: "q"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(agentize.choose_provider(), "none")
+        finally:
+            builtins.input = real_input
+
+    def test_llm_setup_uses_env_key_without_prompt(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test-123"
+        try:
+            cfg = agentize.llm_setup("anthropic")
+        finally:
+            del os.environ["ANTHROPIC_API_KEY"]
+        self.assertEqual(cfg["llm_api_key"], "sk-test-123")
+        self.assertEqual(cfg["llm_model"], agentize.PROVIDERS["anthropic"]["model"])
+        self.assertEqual(agentize.load_config()["llm_provider"], "anthropic")
+
+    def test_call_llm_success(self):
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"  nice prose  "}}]}'
+
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp()):
+            out = agentize.call_llm("openai", "hi", {"llm_api_key": "k"})
+        self.assertEqual(out, "nice prose")
+
+    def test_call_llm_http_error(self):
+        err = urllib.error.HTTPError("https://x", 401, "unauthorized", {},
+                                     io.BytesIO(b'{"error":"bad key"}'))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(RuntimeError) as cm:
+                agentize.call_llm("openai", "hi", {"llm_api_key": "k"})
+        self.assertIn("401", str(cm.exception))
 
 
 if __name__ == "__main__":

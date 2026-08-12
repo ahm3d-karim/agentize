@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import getpass
 import json
 import os
 import re
@@ -35,7 +36,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # --------------------------------------------------------------------------
 # terminal styling — zero-dep ANSI; inert when piped or NO_COLOR
@@ -514,9 +515,10 @@ def render(ev: dict) -> str:
         L.append(f"**Stack:** {' · '.join(bits)}")
         L.append("")
 
-    # ---- description
-    if ev.get("description"):
-        L.append(ev["description"].strip())
+    # ---- description (AI polish wins; it's synthesized from the same evidence)
+    desc = ev.get("ai_overview") or ev.get("description")
+    if desc:
+        L.append(desc.strip())
         L.append("")
 
     # ---- setup commands
@@ -719,6 +721,161 @@ def save_config(cfg: dict) -> None:
         os.chmod(CONFIG_PATH, 0o600)
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# LLM polish mode — bring your own key, OpenAI-compatible endpoints
+# --------------------------------------------------------------------------
+
+PROVIDERS = {
+    "anthropic": {"name": "Anthropic", "base_url": "https://api.anthropic.com/v1",
+                  "model": "claude-sonnet-4-20250514", "key_env": "ANTHROPIC_API_KEY"},
+    "openai": {"name": "OpenAI", "base_url": "https://api.openai.com/v1",
+               "model": "gpt-4o-mini", "key_env": "OPENAI_API_KEY"},
+    "openrouter": {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1",
+                   "model": "anthropic/claude-sonnet-4", "key_env": "OPENROUTER_API_KEY"},
+    "gemini": {"name": "Google Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+               "model": "gemini-2.0-flash", "key_env": "GEMINI_API_KEY"},
+    "xai": {"name": "xAI (Grok)", "base_url": "https://api.x.ai/v1",
+            "model": "grok-2", "key_env": "XAI_API_KEY"},
+    "deepseek": {"name": "DeepSeek", "base_url": "https://api.deepseek.com/v1",
+                 "model": "deepseek-chat", "key_env": "DEEPSEEK_API_KEY"},
+    "groq": {"name": "Groq", "base_url": "https://api.groq.com/openai/v1",
+             "model": "llama-3.3-70b-versatile", "key_env": "GROQ_API_KEY"},
+    "mistral": {"name": "Mistral", "base_url": "https://api.mistral.ai/v1",
+                "model": "mistral-small-latest", "key_env": "MISTRAL_API_KEY"},
+    "ollama": {"name": "Ollama (local)", "base_url": "http://localhost:11434/v1",
+               "model": "llama3.2", "key_env": None},
+    "custom": {"name": "Custom (OpenAI-compatible)", "base_url": None,
+               "model": None, "key_env": None},
+}
+
+
+def choose_provider() -> str:
+    """Numbered provider picker, Hermes-setup style. Returns a PROVIDERS key
+    or 'none' (evidence-only, the default)."""
+    cfg = load_config()
+    if cfg.get("llm_provider"):
+        return cfg["llm_provider"]
+    print()
+    print(bold(cyan("  Choose an AI provider (bring your own key):")))
+    names = list(PROVIDERS)
+    for i, key in enumerate(names, 1):
+        p = PROVIDERS[key]
+        note = "  (local, no key)" if p["key_env"] is None else ""
+        print(f"  {green(str(i) + '.')}  {p['name']:<26}{note}")
+    print(f"  {green('q.')}  Skip — evidence only (default)")
+    for _ in range(3):
+        try:
+            ans = input("\n  Provider: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("agentize: no provider selected")
+        if ans in ("q", "skip", "none"):
+            return "none"
+        try:
+            i = int(ans)
+            if 1 <= i <= len(names):
+                return names[i - 1]
+        except ValueError:
+            pass
+        for key in names:
+            if ans == key or ans == PROVIDERS[key]["name"].lower():
+                return key
+        print("  ?")
+    raise SystemExit("agentize: no provider selected")
+
+
+def llm_setup(provider: str) -> dict:
+    """Collect key/model/base-url for the provider (env > config > prompt),
+    persist to ~/.agentize.json, return the config. Keys are BYOK and stay
+    local — never sent anywhere but the provider's own API."""
+    p = PROVIDERS[provider]
+    cfg = load_config()
+    key = cfg.get("llm_api_key") or (os.environ.get(p["key_env"]) if p["key_env"] else None)
+    base = cfg.get("llm_base_url") or p["base_url"]
+    model = cfg.get("llm_model") or p["model"]
+    if provider == "custom":
+        if not base:
+            base = input("  Base URL (OpenAI-compatible, e.g. https://api.example.com/v1): ").strip()
+        if not model:
+            model = input("  Model name: ").strip()
+        if not base or not model:
+            raise SystemExit("agentize: custom provider needs a base URL and model")
+    if p["key_env"] and not key:
+        key = getpass.getpass(f"  {p['name']} API key (stored locally): ").strip()
+        if not key:
+            raise SystemExit("agentize: no API key — set {0} or paste one".format(p["key_env"]))
+    cfg = {**cfg, "llm_provider": provider, "llm_base_url": base, "llm_model": model}
+    if key:
+        cfg["llm_api_key"] = key
+    save_config(cfg)
+    return cfg
+
+
+def build_polish_prompt(ev: dict) -> str:
+    """Evidence-only prompt: the model may polish prose, never invent facts."""
+    evidence = {k: ev.get(k) for k in
+                ("name", "stack", "description", "structure", "env",
+                 "pitfalls", "conventions", "commands")}
+    return (
+        "You are agentize, a repo-documentation assistant. Below is JSON evidence "
+        "extracted from a repository's REAL config files (commands, stack, "
+        "structure, env vars, gotchas, README description).\n\n"
+        "Write a short Overview for the repo's AGENTS.md: 2-4 sentences describing "
+        "what this project appears to be and how a developer should approach it.\n"
+        "Rules:\n"
+        "- Use ONLY the evidence below. Never invent files, commands, features, or facts.\n"
+        "- Plain prose, no headings, no bullet lists, under 70 words.\n\n"
+        "Evidence JSON:\n" + json.dumps(evidence, indent=2, default=str)
+    )
+
+
+def call_llm(provider: str, prompt: str, cfg: dict) -> str:
+    """One OpenAI-compatible chat completion via urllib — zero deps."""
+    p = PROVIDERS[provider]
+    base = cfg.get("llm_base_url") or p["base_url"]
+    model = cfg.get("llm_model") or p["model"]
+    key = cfg.get("llm_api_key") or (os.environ.get(p["key_env"]) if p["key_env"] else None)
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 300,
+        "temperature": 0.3,
+    }).encode()
+    req = urllib.request.Request(base.rstrip("/") + "/chat/completions",
+                                 data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", USER_AGENT)
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"LLM call failed ({e.code}): {e.read().decode()[:200]}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"LLM call failed: {e.reason}") from None
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"unexpected LLM response: {str(data)[:200]}") from None
+
+
+def polish(ev: dict, provider: str | None, model: str | None,
+           base_url: str | None) -> dict:
+    """LLM polish: add ai_overview to ev. Offline when provider is None/'none'.
+    Commands and structure stay evidence-based — only prose is generated."""
+    if not provider or provider == "none":
+        return ev
+    cfg = llm_setup(provider)
+    if model:
+        cfg = {**cfg, "llm_model": model}
+    if base_url:
+        cfg = {**cfg, "llm_base_url": base_url}
+    with spinner(f"Polishing with {PROVIDERS[provider]['name']} ({cfg['llm_model']})"):
+        text = call_llm(provider, build_polish_prompt(ev), cfg)
+    print(ok("  AI overview generated"))
+    return {**ev, "ai_overview": text}
 
 
 def api_call(token: str, path: str, method: str = "GET",
@@ -1072,11 +1229,19 @@ Usage:
   agentize [PATH] --cursor     also write .cursorrules
   agentize [PATH] --force      overwrite an existing AGENTS.md
   agentize --json              dump extracted evidence as JSON
+  agentize --llm               polish with an LLM (bring your own key)
+  agentize --llm --provider openai --model gpt-4o-mini
   agentize --github            GitHub mode: connect, pick repos, open PRs
   agentize --github --repos a/b,c/d
   agentize --github --dry-run  generate only, push nothing
   agentize --github --notify discord
   agentize --version
+
+Providers: anthropic, openai, openrouter, gemini, xai, deepseek, groq,
+mistral, ollama (local), custom (OpenAI-compatible). Keys are yours —
+stored in ~/.agentize.json, or set the provider's env var (ANTHROPIC_API_KEY,
+OPENAI_API_KEY, ...). Without --llm, agentize is fully offline and never
+calls a model.
 """
 
 
@@ -1085,6 +1250,31 @@ def menu_local_generate() -> int:
     root = Path.cwd().resolve()
     print(dim(f"Scanning {root.name}…"), file=sys.stderr)
     ev = analyze(root)
+    md = render(ev)
+    target = root / "AGENTS.md"
+    if target.exists():
+        try:
+            ans = input(warn("  AGENTS.md already exists here. Overwrite? [y/N] ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("  cancelled")
+            return 0
+        if ans != "y":
+            print("  cancelled")
+            return 0
+    target.write_text(md + "\n", encoding="utf-8")
+    print(ok(f"  wrote {target}"))
+    return 0
+
+
+def menu_ai_polish() -> int:
+    """Menu option 4: pick a provider, generate with LLM-polished prose."""
+    provider = choose_provider()
+    if provider == "none":
+        print("  skipped — evidence only")
+        return 0
+    root = Path.cwd().resolve()
+    print(dim(f"Scanning {root.name}…"), file=sys.stderr)
+    ev = polish(analyze(root), provider, None, None)
     md = render(ev)
     target = root / "AGENTS.md"
     if target.exists():
@@ -1123,6 +1313,7 @@ def interactive_menu() -> int:
         connect_hint = "" if gh else dim("  (will ask to connect)")
         print(f"  {green('2.')}  GitHub — pick repos, open AGENTS.md PRs{connect_hint}")
         print(f"  {green('3.')}  Help — all commands")
+        print(f"  {green('4.')}  AI polish (BYOK) — pick a provider, generate with LLM prose")
         print(f"  {green('q.')}  Quit")
         try:
             choice = input("\n  Choice: ").strip().lower()
@@ -1137,6 +1328,8 @@ def interactive_menu() -> int:
         if choice == "3":
             print("\n" + HELP_TEXT)
             continue
+        if choice == "4":
+            return menu_ai_polish()
         if choice in ("q", "quit", "exit"):
             print(ok("  bye"))
             return 0
@@ -1169,6 +1362,14 @@ def main() -> int:
                     help="generate locally but don't push or open PRs")
     ap.add_argument("--notify", choices=["none", "discord"], default="none",
                     help="notify when done (discord needs DISCORD_BOT_TOKEN + DISCORD_HOME_CHANNEL)")
+    ap.add_argument("--llm", action="store_true",
+                    help="polish the output with an LLM (bring your own key)")
+    ap.add_argument("--provider", metavar="NAME",
+                    help="LLM provider: anthropic, openai, openrouter, gemini, xai, "
+                         "deepseek, groq, mistral, ollama, custom (skips the picker)")
+    ap.add_argument("--model", metavar="NAME", help="LLM model override")
+    ap.add_argument("--base-url", metavar="URL",
+                    help="custom OpenAI-compatible base URL (with --provider custom)")
     ap.add_argument("--version", action="version", version=f"agentize {VERSION}")
     args = ap.parse_args()
 
@@ -1182,6 +1383,12 @@ def main() -> int:
 
     print(dim(f"Scanning {root.name}…"), file=sys.stderr)
     ev = analyze(root)
+
+    if args.llm and not args.json:
+        provider = args.provider or choose_provider()
+        if provider != "none":
+            ev = polish(ev, provider, args.model, args.base_url)
+
     md = render(ev)
 
     if args.json:
