@@ -42,7 +42,15 @@ agentize --help
 
 ## Quick start
 
-Generate a cheat sheet for a repo (current directory by default):
+Run `agentize` with no arguments to open the interactive menu — it shows your
+current folder's detected stack and offers local generation, GitHub mode, and
+help:
+
+```bash
+agentize                       # interactive menu
+```
+
+Non-interactive usage:
 
 ```bash
 agentize .                 # write AGENTS.md in the current repo
@@ -58,7 +66,7 @@ Then open the generated AGENTS.md, sanity-check the commands, commit it. Done.
 Verify the install worked with:
 
 ```bash
-agentize --version   # → agentize 0.2.0
+agentize --version   # → agentize 0.2.1
 ```
 
 ## GitHub mode: AGENTS.md as pull requests

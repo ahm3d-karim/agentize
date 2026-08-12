@@ -1,6 +1,6 @@
 [project]
 name = "agentize"
-version = "0.2.0"
+version = "0.2.1"
 description = "Generate AGENTS.md from a repo's actual config — evidence-based, no guessing."
 readme = "README.md"
 requires-python = ">=3.11"

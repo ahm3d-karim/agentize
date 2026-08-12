@@ -33,7 +33,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # --------------------------------------------------------------------------
 # repo walk
@@ -928,7 +928,91 @@ def github_mode(args) -> int:
     return 1 if fails else 0
 
 
+HELP_TEXT = """agentize — generate AGENTS.md from a repo's actual config
+
+Usage:
+  agentize                     interactive menu
+  agentize [PATH]              write AGENTS.md for a local folder (default: .)
+  agentize [PATH] --stdout     preview without writing
+  agentize [PATH] --claude     also write CLAUDE.md
+  agentize [PATH] --cursor     also write .cursorrules
+  agentize [PATH] --force      overwrite an existing AGENTS.md
+  agentize --json              dump extracted evidence as JSON
+  agentize --github            GitHub mode: connect, pick repos, open PRs
+  agentize --github --repos a/b,c/d
+  agentize --github --dry-run  generate only, push nothing
+  agentize --github --notify discord
+  agentize --version
+"""
+
+
+def menu_local_generate() -> int:
+    """Menu option 1: generate AGENTS.md for the current folder."""
+    root = Path.cwd().resolve()
+    ev = analyze(root)
+    md = render(ev)
+    target = root / "AGENTS.md"
+    if target.exists():
+        try:
+            ans = input("  AGENTS.md already exists here. Overwrite? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("  cancelled")
+            return 0
+        if ans != "y":
+            print("  cancelled")
+            return 0
+    target.write_text(md + "\n", encoding="utf-8")
+    print(f"  wrote {target}")
+    return 0
+
+
+def interactive_menu() -> int:
+    """Bare `agentize`: a small TUI — local generate, GitHub mode, help."""
+    print()
+    print("  ============================================")
+    print("   agentize — AGENTS.md generator for AI agents")
+    print("  ============================================")
+    while True:
+        try:
+            ev = analyze(Path.cwd())
+            bits = [s for s in [", ".join(ev["stack"]["languages"]),
+                                ", ".join(ev["stack"]["frameworks"]),
+                                ev["stack"]["pm"]] if s]
+            ctx = " · ".join(bits) if bits else "no config detected"
+        except Exception:  # noqa: BLE001
+            ctx = "no config detected"
+        print(f"\n  Current folder: {Path.cwd().name}  ({ctx})")
+        print()
+        print("  1.  Generate AGENTS.md here (local)")
+        print("  2.  GitHub — pick repos, open AGENTS.md PRs")
+        print("  3.  Help — all commands")
+        print("  q.  Quit")
+        try:
+            choice = input("\n  Choice: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  bye")
+            return 0
+        if choice == "1":
+            return menu_local_generate()
+        if choice == "2":
+            return github_mode(argparse.Namespace(
+                repos=None, dry_run=False, notify="none"))
+        if choice == "3":
+            print("\n" + HELP_TEXT)
+            continue
+        if choice in ("q", "quit", "exit"):
+            print("  bye")
+            return 0
+        print("  ?")
+
+
 def main() -> int:
+    if not sys.argv[1:]:
+        # bare invocation → interactive interface (or help when stdin is piped)
+        if sys.stdin.isatty():
+            return interactive_menu()
+        print(HELP_TEXT)
+        return 0
     ap = argparse.ArgumentParser(
         prog="agentize",
         description="Generate AGENTS.md from a repo's actual config — evidence-based, no guessing.",
@@ -980,7 +1064,8 @@ def main() -> int:
 
     for label, path in targets:
         if path.exists() and not args.force:
-            print(f"agentize: {label} exists — use --force to overwrite, or --stdout to preview.", file=sys.stderr)
+            print(f"agentize: {label} exists — run bare 'agentize' for the menu, "
+                  f"--force to overwrite, or --stdout to preview.", file=sys.stderr)
             continue
         path.write_text(md + "\n", encoding="utf-8")
         print(f"agentize: wrote {path}")

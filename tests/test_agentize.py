@@ -212,5 +212,24 @@ class TestGithubAuth(unittest.TestCase):
         self.assertEqual(str(e), "not found")
 
 
+class TestMenu(unittest.TestCase):
+    """Bare invocation: interactive when a TTY, help when stdin is piped."""
+
+    def test_bare_invocation_piped_prints_help_without_hanging(self):
+        r = subprocess.run([sys.executable, str(AGENTIZE)],
+                           capture_output=True, text=True, input="", timeout=30)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Usage", r.stdout)
+        self.assertIn("interactive menu", r.stdout)
+
+    def test_bare_invocation_with_path_still_generates(self):
+        # a path arg must keep working (menu only for zero args)
+        with tempfile.TemporaryDirectory() as d:
+            web = materialize("fixture_web", pathlib.Path(d))
+            r = run_cli(str(web))
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("wrote", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
