@@ -142,5 +142,56 @@ class TestLifecycle(unittest.TestCase):
         self.assertTrue((self.web / ".cursorrules").exists())
 
 
+class TestGithubHelpers(unittest.TestCase):
+    """Pure logic of --github mode: selection parsing, filters, config."""
+
+    def test_parse_selection(self):
+        self.assertEqual(agentize.parse_selection("1 3,5", 10), [1, 3, 5])
+        self.assertEqual(agentize.parse_selection("2-4", 10), [2, 3, 4])
+        self.assertEqual(agentize.parse_selection("all", 7), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(agentize.parse_selection("*", 7), list(range(1, 8)))
+        self.assertEqual(agentize.parse_selection("", 7), list(range(1, 8)))
+        self.assertEqual(agentize.parse_selection("11", 10), [])  # out of range → empty
+
+    def test_filter_repos(self):
+        repos = [{"name": "agentize"}, {"name": "lrs-platform"},
+                 {"name": "pid-dashboard"}]
+        self.assertEqual(agentize.filter_repos(repos, "agent"), [0])
+        self.assertEqual(agentize.filter_repos(repos, "platform"), [1])
+        self.assertEqual(agentize.filter_repos(repos, "zzz"), [])
+        self.assertEqual(agentize.filter_repos(repos, "AGENT"), [0])  # case-insensitive
+
+    def test_config_roundtrip(self, tmp_path=None):
+        import tempfile as _tf
+        orig = agentize.CONFIG_PATH
+        with _tf.TemporaryDirectory() as d:
+            agentize.CONFIG_PATH = pathlib.Path(d) / "cfg.json"
+            try:
+                self.assertEqual(agentize.load_config(), {})
+                agentize.save_config({"github_token": "abc123"})
+                self.assertEqual(agentize.load_config()["github_token"], "abc123")
+            finally:
+                agentize.CONFIG_PATH = orig
+
+
+class TestGithubAuth(unittest.TestCase):
+    """Token hygiene and error semantics of --github mode."""
+
+    def test_auth_header_encodes_token(self):
+        h = agentize.auth_header("sekrit-token-123")
+        self.assertIn("http.extraheader=", h)
+        self.assertIn("Basic", h)
+        # the literal token must never appear in the git config value
+        self.assertNotIn("sekrit-token-123", h)
+
+    def test_github_error_is_exception(self):
+        # per-repo failures must be catchable, not SystemExit (batch survival)
+        self.assertTrue(issubclass(agentize.GitHubError, Exception))
+        self.assertFalse(issubclass(agentize.GitHubError, SystemExit))
+        e = agentize.GitHubError(404, "not found")
+        self.assertEqual(e.status, 404)
+        self.assertEqual(str(e), "not found")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,15 +18,22 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import tomllib
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # --------------------------------------------------------------------------
 # repo walk
@@ -597,6 +604,330 @@ def analyze(root: Path) -> dict:
     return ev
 
 
+# --------------------------------------------------------------------------
+# GitHub mode: agentize --github
+# --------------------------------------------------------------------------
+
+CONFIG_PATH = Path.home() / ".agentize.json"
+API = "https://api.github.com"
+USER_AGENT = "agentize"
+
+
+class GitHubError(Exception):
+    """API failure with HTTP status — per-repo errors must not kill the run."""
+
+    def __init__(self, status: int, message: str):
+        self.status = status
+        super().__init__(message)
+
+
+def gh_token() -> str | None:
+    """Reuse an authenticated gh CLI if present — zero setup for gh users."""
+    try:
+        r = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                           text=True, timeout=10)
+        t = r.stdout.strip()
+        return t if r.returncode == 0 and t else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def api_call(token: str, path: str, method: str = "GET",
+             body: dict | None = None) -> dict | list:
+    """Minimal GitHub REST client. Errors raise GitHubError with status."""
+    req = urllib.request.Request(f"{API}{path}", method=method)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", USER_AGENT)
+    data = None
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+        data = json.dumps(body).encode()
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=30) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:200] if e.fp else str(e)
+        raise GitHubError(e.code, f"GitHub API {e.code} on {path}: {detail}")
+
+
+def auth_header(token: str) -> str:
+    """git -c value: Basic-auth header, token base64'd — never in URLs/config."""
+    cred = base64.b64encode(("x-access-token:" + token).encode()).decode()
+    return "http.extraheader=" + "AUTHORIZATION: " + "Basic " + cred
+
+
+def connect_github() -> str:
+    """Return a working token: gh CLI > env > saved config > interactive."""
+    token = gh_token() or os.environ.get("GITHUB_TOKEN") \
+        or load_config().get("github_token")
+    if not token:
+        print("First-time GitHub connect:")
+        print("  1. Create a token: https://github.com/settings/tokens")
+        print("     (scope: repo — classic token is fine)")
+        print("  2. Paste it below and press Enter")
+        try:
+            token = input("Token: ").strip()
+        except EOFError:
+            raise SystemExit("agentize: no token — set GITHUB_TOKEN or run gh auth login")
+        if token:
+            save_config({**load_config(), "github_token": token})
+    if not token:
+        raise SystemExit("agentize: no GitHub token — see --help")
+    try:
+        api_call(token, "/user")  # throws if invalid
+    except GitHubError as e:
+        raise SystemExit(f"agentize: {e}") from None
+    return token
+
+
+def list_repos(token: str) -> list[dict]:
+    repos: list[dict] = []
+    page = 1
+    while True:
+        batch = api_call(token, f"/user/repos?per_page=100&page={page}&sort=updated")
+        if not isinstance(batch, list) or not batch:
+            break
+        repos.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return repos
+
+
+def parse_selection(text: str, n: int) -> list[int]:
+    """'1 3,5' -> [1,3,5]; '2-4' -> [2,3,4]; 'all'/'*'/'' -> everything."""
+    text = text.strip().lower()
+    if text in ("all", "*", ""):
+        return list(range(1, n + 1))
+    out: set[int] = set()
+    for part in re.split(r"[\s,]+", text):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return sorted(i for i in out if 1 <= i <= n)
+
+
+def filter_repos(repos: list[dict], term: str) -> list[int]:
+    """Substring match on repo name — returns matching indices."""
+    term = term.strip().lower()
+    return [i for i, r in enumerate(repos) if term in r["name"].lower()]
+
+
+def pick_repos(repos: list[dict], names_arg: str | None) -> list[int]:
+    """Interactive numbered multi-select; --repos skips the prompt.
+    Accepts bare names ('lrs-platform') or owner-qualified ('owner/lrs-platform').
+    Foreign owner/repo names are left for github_mode to fetch via API."""
+    if names_arg:
+        wanted = [s.strip() for s in names_arg.split(",") if s.strip()]
+        idx = []
+        for w in wanted:
+            hits = [i for i, r in enumerate(repos)
+                    if w == r["name"] or w == r["full_name"]]
+            if not hits and "/" not in w:
+                print(f"agentize: repo not found: {w}", file=sys.stderr)
+            idx.extend(hits)
+        return sorted(set(idx))
+    print(f"\nYour GitHub repos ({len(repos)}):")
+    for i, r in enumerate(repos, 1):
+        flags = []
+        if r["private"]:
+            flags.append("private")
+        if r.get("fork"):
+            flags.append("fork")
+        f = f"  ({', '.join(flags)})" if flags else ""
+        print(f"  {i:>3}.  {r['full_name']:<40}{f}  {r.get('language') or ''}")
+    for _ in range(3):
+        try:
+            ans = input("\nPick repos — numbers (1 3, 2-5), 'all', or a search term: ")
+        except EOFError:
+            raise SystemExit("agentize: no input")
+        try:
+            idx = parse_selection(ans, len(repos))
+            if idx:
+                return idx
+            print("  no match — try again")
+        except ValueError:
+            hit = filter_repos(repos, ans)
+            if hit:
+                return hit
+            print(f"  no repos match '{ans.strip()}' — try again")
+    raise SystemExit("agentize: no repos selected")
+
+
+def ensure_fork(token: str, full_name: str, me: str) -> str:
+    """Fork a repo we don't own; poll until GitHub finishes creating it."""
+    _, repo = full_name.split("/")
+    try:
+        api_call(token, f"/repos/{me}/{repo}")
+        return f"{me}/{repo}"
+    except GitHubError as e:
+        if e.status != 404:
+            raise
+    api_call(token, f"/repos/{full_name}/forks", method="POST")
+    for _ in range(20):
+        time.sleep(1.5)
+        try:
+            api_call(token, f"/repos/{me}/{repo}")
+            return f"{me}/{repo}"
+        except GitHubError:
+            continue
+    raise GitHubError(0, f"fork of {full_name} not ready after 30s")
+
+
+def find_open_pr(token: str, full_name: str, head: str) -> dict | None:
+    """Reuse an existing PR for this head instead of 422-ing."""
+    q = urllib.parse.quote(head, safe="")
+    try:
+        pulls = api_call(token, f"/repos/{full_name}/pulls?state=open&head={q}&per_page=5")
+        return pulls[0] if pulls else None
+    except GitHubError:
+        return None
+
+
+def generate_in_clone(repo: dict, token: str, me: str, dry_run: bool) -> str:
+    """Clone repo, generate AGENTS.md, optionally push a branch + open PR.
+    Returns a status string for the summary. Never raises."""
+    name = repo["full_name"]
+    work = Path(tempfile.mkdtemp(prefix=f"agentize-{repo['name']}-"))
+    try:
+        cmd = ["git", "clone", "--depth", "1", "--quiet"]
+        if repo.get("private"):
+            cmd += ["-c", auth_header(token)]
+        cmd += [repo["clone_url"], str(work)]
+        clone = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if clone.returncode != 0:
+            return f"{name}: clone failed ({clone.stderr.strip()[:80]})"
+        md_path = work / "AGENTS.md"
+        if md_path.exists():
+            return f"{name}: already has AGENTS.md — skipped"
+        md_path.write_text(render(analyze(work)) + "\n", encoding="utf-8")
+        print(f"  {name}: AGENTS.md generated ({md_path.stat().st_size} bytes)")
+        if dry_run:
+            return f"{name}: generated (dry-run, nothing pushed)"
+        return push_pr(repo, token, me, work)
+    except GitHubError as e:
+        return f"{name}: {e}"
+    except Exception as e:  # noqa: BLE001
+        return f"{name}: error — {e}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def push_pr(repo: dict, token: str, me: str, work: Path) -> str:
+    """Branch -> commit -> push (fork if not ours) -> PR. Extraheader auth
+    keeps the token out of remote URLs and git config."""
+    name = repo["full_name"]
+    branch = "agentize/agents-md"
+    subprocess.run(["git", "-C", str(work), "checkout", "-q", "-b", branch], check=True)
+    subprocess.run(["git", "-C", str(work), "add", "AGENTS.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(work), "-c",
+         "user.name=agentize", "-c", "user.email=agentize@users.noreply.github.com",
+         "commit", "-q", "-m", "Add AGENTS.md (generated by agentize)"],
+        check=True)
+    target = name
+    if repo["owner"]["login"] != me:
+        target = ensure_fork(token, name, me)
+        print(f"  {name}: using fork {target}")
+    head = me + ":" + branch
+    # existing PR for this branch? reuse it — don't push or 422
+    existing = find_open_pr(token, name, head)
+    if existing:
+        return f"{name}: PR already open #{existing['number']} → {existing['html_url']}"
+    push = subprocess.run(
+        ["git", "-C", str(work), "-c", auth_header(token),
+         "push", "-q", f"https://github.com/{target}.git", branch],
+        capture_output=True, text=True, timeout=120)
+    if push.returncode != 0:
+        return f"{name}: push failed ({push.stderr.strip()[:100]})"
+    pr = api_call(token, f"/repos/{name}/pulls", method="POST", body={
+        "title": f"Add AGENTS.md for {name}",
+        "head": head,
+        "base": repo["default_branch"],
+        "body": ("Auto-generated by agentize — commands sourced from the "
+                 "repo's actual config files. Review before merging."),
+    })
+    return f"{name}: PR #{pr['number']} → {pr['html_url']}"
+
+
+def notify_discord(text: str) -> None:
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    channel = os.environ.get("DISCORD_HOME_CHANNEL")
+    if not token or not channel:
+        print("  (notify skipped: set DISCORD_BOT_TOKEN + DISCORD_HOME_CHANNEL)")
+        return
+    for i in range(0, len(text), 1900):
+        chunk = text[i:i + 1900]
+        payload = Path(tempfile.mkdtemp()) / "payload.json"
+        payload.write_text(json.dumps({"content": chunk}), encoding="utf-8")
+        subprocess.run(
+            ["curl", "-s", "-X", "POST",
+             f"https://discord.com/api/v10/channels/{channel}/messages",
+             "-H", "Authorization: " + "Bot " + token,
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@" + str(payload)],
+            capture_output=True, text=True)
+        payload.unlink(missing_ok=True)
+
+
+def github_mode(args) -> int:
+    print("agentize — GitHub mode")
+    token = connect_github()
+    me = api_call(token, "/user")["login"]
+    repos = list_repos(token)
+    idx = pick_repos(repos, args.repos)
+    targets = [repos[i] for i in idx]
+    if args.repos:
+        for w in (s.strip() for s in args.repos.split(",") if s.strip()):
+            if "/" in w and w not in {r["name"] for r in targets} \
+                    and w not in {r["full_name"] for r in targets}:
+                try:
+                    extra = api_call(token, f"/repos/{w}")
+                    if extra.get("archived"):
+                        print(f"agentize: skipping {w} — archived", file=sys.stderr)
+                        continue
+                    targets.append(extra)
+                    print(f"agentize: added external repo {w}")
+                except GitHubError as e:
+                    print(f"agentize: skipping {w} — {e}", file=sys.stderr)
+    if not targets:
+        print("agentize: no repos selected", file=sys.stderr)
+        return 1
+    print(f"\nProcessing {len(targets)} repo(s)...\n")
+    results = [generate_in_clone(r, token, me, args.dry_run) for r in targets]
+    print("\nSummary:")
+    fails = 0
+    for line in results:
+        print(f"  {line}")
+        if "PR #" not in line and "already has" not in line and "dry-run" not in line:
+            fails += 1
+    if args.notify == "discord":
+        summary = "\n".join(f"• {r['full_name']}: {s}" for r, s in zip(targets, results))
+        notify_discord(f"agentize done — {len(targets)} repo(s)\n{summary}")
+    return 1 if fails else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="agentize",
@@ -609,8 +940,19 @@ def main() -> int:
     ap.add_argument("--cursor", action="store_true", help="also write .cursorrules")
     ap.add_argument("--force", action="store_true", help="overwrite existing AGENTS.md")
     ap.add_argument("--json", action="store_true", help="dump the extracted evidence as JSON")
+    ap.add_argument("--github", action="store_true",
+                    help="GitHub mode: pick repos from your account, generate AGENTS.md, open PRs")
+    ap.add_argument("--repos", metavar="NAMES",
+                    help="comma-separated repo names (skips the interactive picker)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="generate locally but don't push or open PRs")
+    ap.add_argument("--notify", choices=["none", "discord"], default="none",
+                    help="notify when done (discord needs DISCORD_BOT_TOKEN + DISCORD_HOME_CHANNEL)")
     ap.add_argument("--version", action="version", version=f"agentize {VERSION}")
     args = ap.parse_args()
+
+    if args.github:
+        return github_mode(args)
 
     root = Path(args.path).resolve()
     if not root.is_dir():
