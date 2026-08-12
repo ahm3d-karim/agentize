@@ -42,13 +42,17 @@ agentize --help
 
 ## Quick start
 
-Run `agentize` with no arguments to open the interactive menu — it shows your
-current folder's detected stack and offers local generation, GitHub mode, and
-help:
-
 ```bash
-agentize                       # interactive menu
+agentize            # interactive menu: generate here / GitHub PRs / AI polish / pick a repo
+agentize .          # write AGENTS.md for the current folder
+agentize ../other   # any folder
+agentize . --stdout # preview without writing
 ```
+
+The bare menu's option 5 ("Select repo") lists every git repo in the tree
+(depth ≤ 3) so you can generate for a subfolder without cd-ing around.
+GitHub mode checks AGENTS.md existence and clones in parallel — large
+accounts process in seconds, not minutes.
 
 Non-interactive usage:
 

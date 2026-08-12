@@ -33,10 +33,11 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # --------------------------------------------------------------------------
 # terminal styling — zero-dep ANSI; inert when piped or NO_COLOR
@@ -49,6 +50,31 @@ def color_enabled() -> bool:
     if os.environ.get("AGENTIZE_COLOR") == "1":
         return True
     return sys.stdout.isatty()
+
+
+def _enable_windows_vt() -> None:
+    """Windows: enable ANSI processing on the console — the colorama.init()
+    equivalent, zero deps. CPython only does this automatically on 3.12+;
+    on 3.11 raw \\x1b codes leak into the terminal without it."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        for stream, std in ((sys.stdout, -11), (sys.stderr, -12)):
+            handle = k32.GetStdHandle(std)
+            mode = wintypes.DWORD()
+            if handle not in (0, None) and handle != wintypes.HANDLE(-1).value \
+                    and k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                k32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass  # piped/redirected streams: color_enabled() already falls back
+
+
+_enable_windows_vt()
 
 
 def _s(code: str, s: str) -> str:
@@ -975,14 +1001,20 @@ def list_repos(token: str) -> list[dict]:
 def check_agents_md(token: str, repos: list[dict]) -> dict[str, bool]:
     """full_name -> True if the repo already has AGENTS.md.
     Contents API: 200 = exists, 404 = absent; any other failure counts as
-    absent (generate_in_clone re-checks locally and skips safely)."""
+    absent (generate_in_clone re-checks locally and skips safely).
+    Parallelized — sequential checks of 100+ repos were the slow path."""
     out: dict[str, bool] = {}
-    for r in repos:
+
+    def _one(r: dict) -> tuple[str, bool]:
         try:
             api_call(token, f"/repos/{r['full_name']}/contents/AGENTS.md")
-            out[r["full_name"]] = True
+            return r["full_name"], True
         except GitHubError:
-            out[r["full_name"]] = False
+            return r["full_name"], False
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for name, has in ex.map(_one, repos):
+            out[name] = has
     return out
 
 
@@ -1172,6 +1204,7 @@ def notify_discord(text: str) -> None:
 
 
 def github_mode(args) -> int:
+    t0 = time.monotonic()
     print(bold(cyan("agentize — GitHub mode")))
     token = connect_github()
     me = api_call(token, "/user")["login"]
@@ -1199,8 +1232,15 @@ def github_mode(args) -> int:
     if not targets:
         print("agentize: no repos selected", file=sys.stderr)
         return 1
-    print(f"\nProcessing {len(targets)} repo(s)...\n")
-    results = [generate_in_clone(r, token, me, args.dry_run) for r in targets]
+    print(f"\nProcessing {len(targets)} repo(s)...")
+    results: list[str] = [""] * len(targets)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(generate_in_clone, r, token, me, args.dry_run): i
+                for i, r in enumerate(targets)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            results[i] = fut.result()
+            print(dim(f"  [{sum(1 for x in results if x)}/{len(targets)}] done"))
     print("\nSummary:")
     fails = 0
     for line in results:
@@ -1216,6 +1256,7 @@ def github_mode(args) -> int:
     if args.notify == "discord":
         summary = "\n".join(f"• {r['full_name']}: {s}" for r, s in zip(targets, results))
         notify_discord(f"agentize done — {len(targets)} repo(s)\n{summary}")
+    print(ok(f"Done — {len(targets)} repo(s) in {time.monotonic() - t0:.1f}s"))
     return 1 if fails else 0
 
 
@@ -1245,24 +1286,82 @@ calls a model.
 """
 
 
-def menu_local_generate() -> int:
-    """Menu option 1: generate AGENTS.md for the current folder."""
-    root = Path.cwd().resolve()
-    print(dim(f"Scanning {root.name}…"), file=sys.stderr)
-    ev = analyze(root)
-    md = render(ev)
+def write_agents_md(root: Path, md: str) -> bool:
+    """Overwrite-confirm + write AGENTS.md into root. True if written."""
     target = root / "AGENTS.md"
     if target.exists():
         try:
             ans = input(warn("  AGENTS.md already exists here. Overwrite? [y/N] ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("  cancelled")
-            return 0
+            return False
         if ans != "y":
             print("  cancelled")
-            return 0
+            return False
     target.write_text(md + "\n", encoding="utf-8")
     print(ok(f"  wrote {target}"))
+    return True
+
+
+def menu_local_generate() -> int:
+    """Menu option 1: generate AGENTS.md for the current folder."""
+    root = Path.cwd().resolve()
+    print(dim(f"Scanning {root.name}…"), file=sys.stderr)
+    t0 = time.monotonic()
+    md = render(analyze(root))
+    if write_agents_md(root, md):
+        print(ok(f"Done — {time.monotonic() - t0:.1f}s"))
+    return 0
+
+
+def pick_local_repo(base: Path | None = None) -> Path:
+    """Numbered pick of git repos in the tree (depth <= 3). Defaults to cwd."""
+    base = (base or Path.cwd()).resolve()
+    found = [base]
+    for dirpath, dirnames, _ in os.walk(base):
+        depth = dirpath[len(str(base)):].count(os.sep)
+        if depth >= 3:
+            dirnames[:] = []
+            continue
+        # .git must be detected BEFORE pruning (it's in PRUNE_DIRS)
+        if ".git" in dirnames:
+            found.append(Path(dirpath))
+            dirnames.remove(".git")
+        dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+    found.sort(key=lambda p: (p != base, str(p).lower()))
+    if len(found) == 1:
+        print(dim("  no other git repos in this tree — using current folder"))
+        return base
+    print()
+    for i, p in enumerate(found, 1):
+        label = " (current)" if p == base else ""
+        shown = p.name if p == base else p.relative_to(base).as_posix()
+        print(f"  {green(str(i) + '.')}  {shown}{dim(label)}")
+    for _ in range(3):
+        try:
+            ans = input("\n  Select repo: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return base
+        try:
+            i = int(ans)
+            if 1 <= i <= len(found):
+                return found[i - 1]
+        except ValueError:
+            pass
+        print("  ?")
+    return base
+
+
+def menu_selected_repo() -> int:
+    """Menu option 5: pick a git repo in the tree, generate there."""
+    root = pick_local_repo()
+    if root != Path.cwd().resolve():
+        print(dim(f"  Selected: {root}"))
+    print(dim(f"Scanning {root.name}…"), file=sys.stderr)
+    t0 = time.monotonic()
+    md = render(analyze(root))
+    if write_agents_md(root, md):
+        print(ok(f"Done — {time.monotonic() - t0:.1f}s"))
     return 0
 
 
@@ -1274,20 +1373,11 @@ def menu_ai_polish() -> int:
         return 0
     root = Path.cwd().resolve()
     print(dim(f"Scanning {root.name}…"), file=sys.stderr)
+    t0 = time.monotonic()
     ev = polish(analyze(root), provider, None, None)
     md = render(ev)
-    target = root / "AGENTS.md"
-    if target.exists():
-        try:
-            ans = input(warn("  AGENTS.md already exists here. Overwrite? [y/N] ")).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("  cancelled")
-            return 0
-        if ans != "y":
-            print("  cancelled")
-            return 0
-    target.write_text(md + "\n", encoding="utf-8")
-    print(ok(f"  wrote {target}"))
+    if write_agents_md(root, md):
+        print(ok(f"Done — {time.monotonic() - t0:.1f}s"))
     return 0
 
 
@@ -1314,6 +1404,7 @@ def interactive_menu() -> int:
         print(f"  {green('2.')}  GitHub — pick repos, open AGENTS.md PRs{connect_hint}")
         print(f"  {green('3.')}  Help — all commands")
         print(f"  {green('4.')}  AI polish (BYOK) — pick a provider, generate with LLM prose")
+        print(f"  {green('5.')}  Select repo — pick a git repo in this tree")
         print(f"  {green('q.')}  Quit")
         try:
             choice = input("\n  Choice: ").strip().lower()
@@ -1330,6 +1421,8 @@ def interactive_menu() -> int:
             continue
         if choice == "4":
             return menu_ai_polish()
+        if choice == "5":
+            return menu_selected_repo()
         if choice in ("q", "quit", "exit"):
             print(ok("  bye"))
             return 0
@@ -1382,6 +1475,7 @@ def main() -> int:
         return 1
 
     print(dim(f"Scanning {root.name}…"), file=sys.stderr)
+    t0 = time.monotonic()
     ev = analyze(root)
 
     if args.llm and not args.json:
@@ -1407,6 +1501,7 @@ def main() -> int:
     if args.cursor:
         targets.append((".cursorrules", root / ".cursorrules"))
 
+    written = 0
     for label, path in targets:
         if path.exists() and not args.force:
             print(warn(f"agentize: {label} exists — run bare 'agentize' for the menu, "
@@ -1414,6 +1509,9 @@ def main() -> int:
             continue
         path.write_text(md + "\n", encoding="utf-8")
         print(ok(f"agentize: wrote {path}"))
+        written += 1
+    if written:
+        print(ok(f"Done — {written} file(s) in {time.monotonic() - t0:.1f}s"))
 
     return 0
 

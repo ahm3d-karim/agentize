@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -152,6 +153,7 @@ class TestLifecycle(unittest.TestCase):
         r1 = run_cli(str(self.web))
         self.assertEqual(r1.returncode, 0)
         self.assertIn("wrote", r1.stdout)
+        self.assertIn("Done", r1.stdout)  # completion message with timing
 
         r2 = run_cli(str(self.web))
         self.assertIn("exists", r2.stderr)
@@ -407,6 +409,55 @@ class TestLlmPolish(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 agentize.call_llm("openai", "hi", {"llm_api_key": "k"})
         self.assertIn("401", str(cm.exception))
+
+
+class TestLocalRepoPicker(unittest.TestCase):
+    """Menu option 5: pick a git repo in the tree."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = pathlib.Path(self.tmp.name)
+        (base / "a" / ".git").mkdir(parents=True)
+        (base / "b" / ".git").mkdir(parents=True)
+
+    def test_picks_by_number(self):
+        base = pathlib.Path(self.tmp.name)
+        real_input = builtins.input
+        builtins.input = lambda *a, **k: "2"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = agentize.pick_local_repo(base)
+        finally:
+            builtins.input = real_input
+        self.assertEqual(got, base.resolve() / "a")  # order: base, a, b
+
+    def test_eof_falls_back_to_base(self):
+        base = pathlib.Path(self.tmp.name)
+        real_input = builtins.input
+        builtins.input = lambda *a, **k: (_ for _ in ()).throw(EOFError())
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = agentize.pick_local_repo(base)
+        finally:
+            builtins.input = real_input
+        self.assertEqual(got, base.resolve())
+
+    def test_single_repo_skips_prompt(self):
+        base = pathlib.Path(self.tmp.name)
+        shutil.rmtree(base / "b")
+        real_input = builtins.input
+        builtins.input = lambda *a, **k: "99"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = agentize.pick_local_repo(base)
+        finally:
+            builtins.input = real_input
+        self.assertEqual(got, base.resolve())
+
+    def test_windows_vt_enable_is_safe(self):
+        # piped streams: must be a silent no-op, never raise
+        agentize._enable_windows_vt()
 
 
 if __name__ == "__main__":
