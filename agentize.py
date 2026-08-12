@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import urllib.error
@@ -33,7 +35,79 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
+
+# --------------------------------------------------------------------------
+# terminal styling — zero-dep ANSI; inert when piped or NO_COLOR
+# --------------------------------------------------------------------------
+
+
+def color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("AGENTIZE_COLOR") == "1":
+        return True
+    return sys.stdout.isatty()
+
+
+def _s(code: str, s: str) -> str:
+    return f"\x1b[{code}m{s}\x1b[0m" if color_enabled() else s
+
+
+def ok(s: str) -> str:
+    return _s("32", "✓ " + s)
+
+
+def warn(s: str) -> str:
+    return _s("33", "⚠ " + s)
+
+
+def err(s: str) -> str:
+    return _s("31", "✗ " + s)
+
+
+def green(s: str) -> str:
+    return _s("32", s)
+
+
+def cyan(s: str) -> str:
+    return _s("36", s)
+
+
+def dim(s: str) -> str:
+    return _s("2", s)
+
+
+def bold(s: str) -> str:
+    return _s("1", s)
+
+
+@contextlib.contextmanager
+def spinner(msg: str):
+    """Rotating stderr spinner; degrades to a plain line when not a TTY."""
+    if not color_enabled():
+        print(dim(msg), file=sys.stderr)
+        yield
+        return
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    stop = threading.Event()
+
+    def _spin():
+        i = 0
+        cr = chr(13)
+        while not stop.is_set():
+            sys.stderr.write(cr + "[2m" + frames[i % len(frames)] + " " + msg + "[0m ")
+            sys.stderr.flush()
+            i += 1
+            time.sleep(0.08)
+        sys.stderr.write(cr + " " * (len(msg) + 4) + cr)
+    t = threading.Thread(target=_spin, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(0.5)
 
 # --------------------------------------------------------------------------
 # repo walk
@@ -674,27 +748,57 @@ def auth_header(token: str) -> str:
 
 
 def connect_github() -> str:
-    """Return a working token: gh CLI > env > saved config > interactive."""
+    """Return a working token: gh CLI > env > saved config > guided connect."""
     token = gh_token() or os.environ.get("GITHUB_TOKEN") \
         or load_config().get("github_token")
-    if not token:
-        print("First-time GitHub connect:")
-        print("  1. Create a token: https://github.com/settings/tokens")
-        print("     (scope: repo — classic token is fine)")
-        print("  2. Paste it below and press Enter")
+    if token:
         try:
-            token = input("Token: ").strip()
-        except EOFError:
-            raise SystemExit("agentize: no token — set GITHUB_TOKEN or run gh auth login")
-        if token:
+            api_call(token, "/user")  # throws if invalid
+            return token
+        except GitHubError:
+            token = None  # stale token — fall through to guided connect
+    print(warn("GitHub not connected."))
+    print()
+    print("  1.  Run `gh auth login` (recommended)")
+    print("  2.  Paste a personal access token")
+    print("  3.  Skip")
+    for _ in range(3):
+        try:
+            ans = input("\n  How do you want to connect? ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("agentize: no GitHub connection")
+        if ans in ("1", "gh", "login"):
+            if not shutil.which("gh"):
+                print("  gh CLI not installed — use option 2 (token).")
+                continue
+            print(dim("  Running `gh auth login` — follow the prompts…"))
+            rc = subprocess.run(["gh", "auth", "login"]).returncode
+            token = gh_token() if rc == 0 else None
+            if token:
+                print(ok("Connected via gh CLI"))
+                return token
+            print(warn("  gh still not authenticated — paste a token instead:"))
+        if ans in ("2", "token", "paste"):
+            print("  Create one: https://github.com/settings/tokens  (scope: repo)")
+            try:
+                token = input("  Token: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit("agentize: no GitHub connection")
+            if not token:
+                continue
             save_config({**load_config(), "github_token": token})
-    if not token:
-        raise SystemExit("agentize: no GitHub token — see --help")
-    try:
-        api_call(token, "/user")  # throws if invalid
-    except GitHubError as e:
-        raise SystemExit(f"agentize: {e}") from None
-    return token
+            try:
+                api_call(token, "/user")
+                print(ok("Connected with token"))
+                return token
+            except GitHubError as e:
+                print(err(f"  token rejected: {e}"))
+                token = None
+                continue
+        if ans in ("3", "skip", "q", "quit"):
+            raise SystemExit("agentize: GitHub not connected")
+        print("  ?")
+    raise SystemExit("agentize: no GitHub connection")
 
 
 def list_repos(token: str) -> list[dict]:
@@ -709,6 +813,20 @@ def list_repos(token: str) -> list[dict]:
             break
         page += 1
     return repos
+
+
+def check_agents_md(token: str, repos: list[dict]) -> dict[str, bool]:
+    """full_name -> True if the repo already has AGENTS.md.
+    Contents API: 200 = exists, 404 = absent; any other failure counts as
+    absent (generate_in_clone re-checks locally and skips safely)."""
+    out: dict[str, bool] = {}
+    for r in repos:
+        try:
+            api_call(token, f"/repos/{r['full_name']}/contents/AGENTS.md")
+            out[r["full_name"]] = True
+        except GitHubError:
+            out[r["full_name"]] = False
+    return out
 
 
 def parse_selection(text: str, n: int) -> list[int]:
@@ -734,10 +852,12 @@ def filter_repos(repos: list[dict], term: str) -> list[int]:
     return [i for i, r in enumerate(repos) if term in r["name"].lower()]
 
 
-def pick_repos(repos: list[dict], names_arg: str | None) -> list[int]:
+def pick_repos(repos: list[dict], names_arg: str | None,
+               has_agents: dict[str, bool] | None = None) -> list[int]:
     """Interactive numbered multi-select; --repos skips the prompt.
     Accepts bare names ('lrs-platform') or owner-qualified ('owner/lrs-platform').
-    Foreign owner/repo names are left for github_mode to fetch via API."""
+    Foreign owner/repo names are left for github_mode to fetch via API.
+    `has_agents` marks repos that already carry AGENTS.md next to their name."""
     if names_arg:
         wanted = [s.strip() for s in names_arg.split(",") if s.strip()]
         idx = []
@@ -756,7 +876,10 @@ def pick_repos(repos: list[dict], names_arg: str | None) -> list[int]:
         if r.get("fork"):
             flags.append("fork")
         f = f"  ({', '.join(flags)})" if flags else ""
-        print(f"  {i:>3}.  {r['full_name']:<40}{f}  {r.get('language') or ''}")
+        mark = ""
+        if has_agents and has_agents.get(r["full_name"]):
+            mark = "  " + warn("has AGENTS.md")
+        print(f"  {i:>3}.  {r['full_name']:<40}{f}  {r.get('language') or ''}{mark}")
     for _ in range(3):
         try:
             ans = input("\nPick repos — numbers (1 3, 2-5), 'all', or a search term: ")
@@ -822,7 +945,7 @@ def generate_in_clone(repo: dict, token: str, me: str, dry_run: bool) -> str:
         if md_path.exists():
             return f"{name}: already has AGENTS.md — skipped"
         md_path.write_text(render(analyze(work)) + "\n", encoding="utf-8")
-        print(f"  {name}: AGENTS.md generated ({md_path.stat().st_size} bytes)")
+        print("  " + ok(f"{name}: AGENTS.md generated ({md_path.stat().st_size} bytes)"))
         if dry_run:
             return f"{name}: generated (dry-run, nothing pushed)"
         return push_pr(repo, token, me, work)
@@ -849,7 +972,7 @@ def push_pr(repo: dict, token: str, me: str, work: Path) -> str:
     target = name
     if repo["owner"]["login"] != me:
         target = ensure_fork(token, name, me)
-        print(f"  {name}: using fork {target}")
+        print(dim(f"  {name}: using fork {target}"))
     head = me + ":" + branch
     # existing PR for this branch? reuse it — don't push or 422
     existing = find_open_pr(token, name, head)
@@ -892,11 +1015,16 @@ def notify_discord(text: str) -> None:
 
 
 def github_mode(args) -> int:
-    print("agentize — GitHub mode")
+    print(bold(cyan("agentize — GitHub mode")))
     token = connect_github()
     me = api_call(token, "/user")["login"]
+    print(ok(f"Connected as {me}"))
     repos = list_repos(token)
-    idx = pick_repos(repos, args.repos)
+    has = None
+    if not args.repos:
+        with spinner(f"Checking AGENTS.md status across {len(repos)} repos"):
+            has = check_agents_md(token, repos)
+    idx = pick_repos(repos, args.repos, has)
     targets = [repos[i] for i in idx]
     if args.repos:
         for w in (s.strip() for s in args.repos.split(",") if s.strip()):
@@ -919,8 +1047,14 @@ def github_mode(args) -> int:
     print("\nSummary:")
     fails = 0
     for line in results:
-        print(f"  {line}")
-        if "PR #" not in line and "already has" not in line and "dry-run" not in line:
+        if "PR #" in line:
+            print("  " + ok(line))
+        elif "already has" in line or "skipped" in line:
+            print("  " + warn(line))
+        elif "dry-run" in line:
+            print("  " + cyan(line))
+        else:
+            print("  " + err(line))
             fails += 1
     if args.notify == "discord":
         summary = "\n".join(f"• {r['full_name']}: {s}" for r, s in zip(targets, results))
@@ -949,12 +1083,13 @@ Usage:
 def menu_local_generate() -> int:
     """Menu option 1: generate AGENTS.md for the current folder."""
     root = Path.cwd().resolve()
+    print(dim(f"Scanning {root.name}…"), file=sys.stderr)
     ev = analyze(root)
     md = render(ev)
     target = root / "AGENTS.md"
     if target.exists():
         try:
-            ans = input("  AGENTS.md already exists here. Overwrite? [y/N] ").strip().lower()
+            ans = input(warn("  AGENTS.md already exists here. Overwrite? [y/N] ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("  cancelled")
             return 0
@@ -962,16 +1097,16 @@ def menu_local_generate() -> int:
             print("  cancelled")
             return 0
     target.write_text(md + "\n", encoding="utf-8")
-    print(f"  wrote {target}")
+    print(ok(f"  wrote {target}"))
     return 0
 
 
 def interactive_menu() -> int:
     """Bare `agentize`: a small TUI — local generate, GitHub mode, help."""
+    gh = gh_token() or os.environ.get("GITHUB_TOKEN") or load_config().get("github_token")
     print()
-    print("  ============================================")
-    print("   agentize — AGENTS.md generator for AI agents")
-    print("  ============================================")
+    print(bold(cyan("  ⚡ agentize — AGENTS.md generator for AI agents")))
+    print(dim("  ───────────────────────────────────────────────────"))
     while True:
         try:
             ev = analyze(Path.cwd())
@@ -981,16 +1116,18 @@ def interactive_menu() -> int:
             ctx = " · ".join(bits) if bits else "no config detected"
         except Exception:  # noqa: BLE001
             ctx = "no config detected"
-        print(f"\n  Current folder: {Path.cwd().name}  ({ctx})")
+        print(dim(f"\n  Current folder: {Path.cwd().name}  ({ctx})"))
+        print(dim(f"  GitHub: {'connected' if gh else 'not connected'}"))
         print()
-        print("  1.  Generate AGENTS.md here (local)")
-        print("  2.  GitHub — pick repos, open AGENTS.md PRs")
-        print("  3.  Help — all commands")
-        print("  q.  Quit")
+        print(f"  {green('1.')}  Generate AGENTS.md here (local)")
+        connect_hint = "" if gh else dim("  (will ask to connect)")
+        print(f"  {green('2.')}  GitHub — pick repos, open AGENTS.md PRs{connect_hint}")
+        print(f"  {green('3.')}  Help — all commands")
+        print(f"  {green('q.')}  Quit")
         try:
             choice = input("\n  Choice: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("\n  bye")
+            print(ok("\n  bye"))
             return 0
         if choice == "1":
             return menu_local_generate()
@@ -1001,7 +1138,7 @@ def interactive_menu() -> int:
             print("\n" + HELP_TEXT)
             continue
         if choice in ("q", "quit", "exit"):
-            print("  bye")
+            print(ok("  bye"))
             return 0
         print("  ?")
 
@@ -1040,9 +1177,10 @@ def main() -> int:
 
     root = Path(args.path).resolve()
     if not root.is_dir():
-        print(f"agentize: not a directory: {root}", file=sys.stderr)
+        print(err(f"agentize: not a directory: {root}"), file=sys.stderr)
         return 1
 
+    print(dim(f"Scanning {root.name}…"), file=sys.stderr)
     ev = analyze(root)
     md = render(ev)
 
@@ -1064,11 +1202,11 @@ def main() -> int:
 
     for label, path in targets:
         if path.exists() and not args.force:
-            print(f"agentize: {label} exists — run bare 'agentize' for the menu, "
-                  f"--force to overwrite, or --stdout to preview.", file=sys.stderr)
+            print(warn(f"agentize: {label} exists — run bare 'agentize' for the menu, "
+                       f"--force to overwrite, or --stdout to preview."), file=sys.stderr)
             continue
         path.write_text(md + "\n", encoding="utf-8")
-        print(f"agentize: wrote {path}")
+        print(ok(f"agentize: wrote {path}"))
 
     return 0
 

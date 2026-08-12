@@ -3,6 +3,9 @@
 Run from the repo root:  python -m unittest discover -s tests -v
 Or via pytest, if you have it:  pytest tests/ -q
 """
+import builtins
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -229,6 +232,85 @@ class TestMenu(unittest.TestCase):
             r = run_cli(str(web))
             self.assertEqual(r.returncode, 0)
             self.assertIn("wrote", r.stdout)
+
+
+class TestStyle(unittest.TestCase):
+    """Zero-dep styling must be inert when piped/NO_COLOR, active on demand."""
+
+    def setUp(self):
+        self._nc = os.environ.pop("NO_COLOR", None)
+        self._ac = os.environ.pop("AGENTIZE_COLOR", None)
+
+    def tearDown(self):
+        if self._nc:
+            os.environ["NO_COLOR"] = self._nc
+        if self._ac:
+            os.environ["AGENTIZE_COLOR"] = self._ac
+
+    def test_color_off_when_piped(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(agentize.color_enabled())  # StringIO: not a tty
+            # ✓ prefix is part of the message; only the ANSI codes must vanish
+            self.assertEqual(agentize.ok("wrote x"), "✓ wrote x")
+            self.assertNotIn("\x1b", agentize.ok("wrote x"))
+            self.assertNotIn("\x1b", agentize.err("boom"))
+
+    def test_force_color_env(self):
+        os.environ["AGENTIZE_COLOR"] = "1"
+        self.assertTrue(agentize.color_enabled())
+        self.assertIn("\x1b[32m", agentize.ok("wrote x"))
+        self.assertIn("\x1b[33m", agentize.warn("careful"))
+
+    def test_no_color_env_wins(self):
+        os.environ["NO_COLOR"] = "1"
+        os.environ["AGENTIZE_COLOR"] = "1"
+        self.assertFalse(agentize.color_enabled())
+
+
+class TestAgentsMdMarkers(unittest.TestCase):
+    """'already has AGENTS.md' detection for the repo picker."""
+
+    def test_check_agents_md(self):
+        real = agentize.api_call
+
+        def fake(token, path, method="GET", body=None):
+            if path.endswith("/contents/AGENTS.md"):
+                if "hasit" in path:
+                    return {"name": "AGENTS.md"}
+                raise agentize.GitHubError(404, "not found")
+            raise AssertionError(f"unexpected call: {path}")
+
+        agentize.api_call = fake
+        try:
+            repos = [{"full_name": "me/hasit"}, {"full_name": "me/lacks"}]
+            self.assertEqual(agentize.check_agents_md("t", repos),
+                             {"me/hasit": True, "me/lacks": False})
+        finally:
+            agentize.api_call = real
+
+    def test_pick_repos_marks_existing(self):
+        # color off → the marker text appears plainly, next to the repo
+        repos = [{"full_name": "me/hasit", "name": "hasit", "private": False,
+                  "fork": False, "language": "Python"},
+                 {"full_name": "me/lacks", "name": "lacks", "private": False,
+                  "fork": False, "language": "Go"}]
+        has = {"me/hasit": True}
+        real_input = builtins.input
+        builtins.input = lambda *a, **k: "q"  # three misses → SystemExit
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                with self.assertRaises(SystemExit):
+                    agentize.pick_repos(repos, None, has)
+        finally:
+            builtins.input = real_input
+        out = buf.getvalue()
+        self.assertIn("me/hasit", out)
+        self.assertIn("has AGENTS.md", out)
+        # the marker must sit on the hasit line, not the lacks line
+        hasit_line = next(l for l in out.splitlines() if "me/hasit" in l)
+        self.assertIn("has AGENTS.md", hasit_line)
+        self.assertNotIn("has AGENTS.md",
+                         next(l for l in out.splitlines() if "me/lacks" in l))
 
 
 if __name__ == "__main__":
