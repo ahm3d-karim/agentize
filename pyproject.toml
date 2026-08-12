@@ -1,0 +1,16 @@
+[project]
+name = "agentize"
+version = "0.1.0"
+description = "Generate AGENTS.md from a repo's actual config — evidence-based, no guessing."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+agentize = "agentize:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
