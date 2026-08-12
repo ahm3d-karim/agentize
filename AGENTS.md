@@ -19,7 +19,7 @@ Generate `AGENTS.md` (and optionally `CLAUDE.md` / `.cursorrules`) from a codeba
 
 - `README.md` — readme
 - `pyproject.toml` — Python project config
-- `tests/` — tests (9 files)
+- `tests/` — tests (2 files)
 
 ## Command reference (sources)
 

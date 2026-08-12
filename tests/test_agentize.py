@@ -4,8 +4,8 @@ Run from the repo root:  python -m unittest discover -s tests -v
 Or via pytest, if you have it:  pytest tests/ -q
 """
 import json
+import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,9 +15,8 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 import agentize  # noqa: E402
+from tests.fixtures import materialize  # noqa: E402
 
-WEB = REPO / "tests" / "fixture_web"
-ML = REPO / "tests" / "fixture_ml"
 AGENTIZE = REPO / "agentize.py"
 
 
@@ -31,8 +30,14 @@ class TestExtractionWeb(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.ev = agentize.analyze(WEB)
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.web = materialize("fixture_web", pathlib.Path(cls.tmp.name))
+        cls.ev = agentize.analyze(cls.web)
         cls.md = agentize.render(cls.ev)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
 
     def test_install_command_sourced(self):
         self.assertIn("npm install", self.md)
@@ -68,8 +73,14 @@ class TestNoFabrication(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.ev = agentize.analyze(ML)
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.ml = materialize("fixture_ml", pathlib.Path(cls.tmp.name))
+        cls.ev = agentize.analyze(cls.ml)
         cls.md = agentize.render(cls.ev)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
 
     def test_editable_install(self):
         self.assertIn("`pip install -e .`", self.md)
@@ -103,8 +114,17 @@ class TestSelfDogfood(unittest.TestCase):
 
 
 class TestJsonMode(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.web = materialize("fixture_web", pathlib.Path(cls.tmp.name))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
     def test_evidence_is_json(self):
-        r = run_cli(str(WEB), "--json")
+        r = run_cli(str(self.web), "--json")
         self.assertEqual(r.returncode, 0)
         data = json.loads(r.stdout)
         self.assertIsInstance(data, dict)
@@ -115,13 +135,12 @@ class TestJsonMode(unittest.TestCase):
 
 class TestLifecycle(unittest.TestCase):
     """Write / refuse-overwrite / force / --claude / --cursor, on a temp copy.
-    Each test gets its own fresh copy — methods run alphabetically, so
+    Each test gets its own fresh fixture — methods run alphabetically, so
     shared state (a leftover AGENTS.md) would make assertions order-dependent."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.web = pathlib.Path(self.tmp.name) / "web"
-        shutil.copytree(WEB, self.web)
+        self.web = materialize("fixture_web", pathlib.Path(self.tmp.name))
         self.addCleanup(self.tmp.cleanup)
 
     def test_write_then_refuse_then_force(self):
