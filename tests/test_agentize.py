@@ -460,5 +460,32 @@ class TestLocalRepoPicker(unittest.TestCase):
         agentize._enable_windows_vt()
 
 
+class TestQuickStack(unittest.TestCase):
+    """Menu startup: root-level manifests only, no recursive walk."""
+
+    def test_detects_stack_without_walk(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            (root / "package.json").write_text(
+                '{"scripts": {"dev": "next dev"}, "dependencies": {"next": "^15"}}')
+            (root / "sub").mkdir()
+            (root / "sub" / "deep.py").write_text("x")
+            out = agentize.quick_stack(root)
+            self.assertIn("npm", out)
+            self.assertIn("Next.js", out)
+
+    def test_empty_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(agentize.quick_stack(pathlib.Path(d)),
+                             "no config detected")
+
+    def test_walk_repo_capped(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            for i in range(50):
+                (root / f"f{i}.txt").write_text("x")
+            self.assertLessEqual(len(agentize.walk_repo(root)), agentize.MAX_WALK_FILES)
+
+
 if __name__ == "__main__":
     unittest.main()

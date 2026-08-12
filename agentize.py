@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # --------------------------------------------------------------------------
 # terminal styling — zero-dep ANSI; inert when piped or NO_COLOR
@@ -146,13 +146,14 @@ PRUNE_DIRS = {
     "target", "coverage", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".tox", ".eggs", ".idea", ".vscode", ".yarn", ".pnpm-store", ".serverless",
     ".vercel", ".expo", ".terraform", ".gitlab", "site-packages", ".docusaurus",
-    ".storybook-static", "cdk.out",
+    ".storybook-static", "cdk.out", "AppData", ".hermes", ".local",
 }
 
 PRUNE_SUFFIXES = {".egg-info", ".pyc", ".png", ".jpg", ".jpeg", ".gif", ".svg",
                   ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".lock"}
 
 MAX_FILES_FOR_DOCS = 400
+MAX_WALK_FILES = 30_000  # safety cap — pathological trees must not hang the tool
 
 
 def walk_repo(root: Path) -> list[Path]:
@@ -165,7 +166,38 @@ def walk_repo(root: Path) -> list[Path]:
             if p.suffix.lower() in PRUNE_SUFFIXES:
                 continue
             files.append(p)
+            if len(files) >= MAX_WALK_FILES:
+                return files
     return files
+
+
+def quick_stack(root: Path) -> str:
+    """Cheap stack line for the menu — root-level manifests only, NO walk.
+    detect_stack needs nothing deeper than the root; a recursive walk here
+    made the bare menu take ~11s in a home directory (192k files)."""
+    names: set[str] = set()
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                if e.is_file():
+                    names.add(e.name)
+    except OSError:
+        return "no config detected"
+    langs = [lang for fn, lang in LANG_BY_FILE.items() if fn in names]
+    pm = next((name for lock, name in LOCKFILE_TO_PM.items() if lock in names), None)
+    if pm is None and "package.json" in names:
+        pm = "npm"
+    blob = ""
+    for fn in ("package.json", "pyproject.toml", "Cargo.toml",
+               "requirements.txt", "go.mod"):
+        if fn in names:
+            blob += "\n" + (read_small(root / fn) or "")
+    frameworks: list[str] = []
+    for rx, name in FRAMEWORK_MARKERS:
+        if rx.search(blob) and name not in frameworks:
+            frameworks.append(name)
+    bits = [s for s in [", ".join(langs), ", ".join(frameworks), pm] if s]
+    return " · ".join(bits) if bits else "no config detected"
 
 
 def rel(root: Path, p: Path) -> str:
@@ -1384,19 +1416,13 @@ def menu_ai_polish() -> int:
 def interactive_menu() -> int:
     """Bare `agentize`: a small TUI — local generate, GitHub mode, help."""
     gh = gh_token() or os.environ.get("GITHUB_TOKEN") or load_config().get("github_token")
+    cwd = Path.cwd().resolve()
+    ctx = quick_stack(cwd)  # computed ONCE — no per-keystroke repo walk
     print()
     print(bold(cyan("  ⚡ agentize — AGENTS.md generator for AI agents")))
     print(dim("  ───────────────────────────────────────────────────"))
     while True:
-        try:
-            ev = analyze(Path.cwd())
-            bits = [s for s in [", ".join(ev["stack"]["languages"]),
-                                ", ".join(ev["stack"]["frameworks"]),
-                                ev["stack"]["pm"]] if s]
-            ctx = " · ".join(bits) if bits else "no config detected"
-        except Exception:  # noqa: BLE001
-            ctx = "no config detected"
-        print(dim(f"\n  Current folder: {Path.cwd().name}  ({ctx})"))
+        print(dim(f"\n  Current folder: {cwd.name}  ({ctx})"))
         print(dim(f"  GitHub: {'connected' if gh else 'not connected'}"))
         print()
         print(f"  {green('1.')}  Generate AGENTS.md here (local)")
