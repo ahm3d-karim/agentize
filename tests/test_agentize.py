@@ -558,6 +558,16 @@ class TestLocalRepoPicker(unittest.TestCase):
         # piped streams: must be a silent no-op, never raise
         agentize._enable_windows_vt()
 
+    def test_piped_stdout_is_utf8_safe(self):
+        # Windows pipes default to cp1252; ✓ (U+2713) must not crash a
+        # piped child (this was a real Windows-CI regression).
+        code = ("import sys; sys.path.insert(0, r'%s'); "
+                "import agentize; print(agentize.ok('wrote x'))" % REPO)
+        r = subprocess.run([sys.executable, "-c", code],
+                           capture_output=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("\u2713 wrote x", r.stdout.decode("utf-8", "replace"))
+
 
 class TestQuickStack(unittest.TestCase):
     """Menu startup: root-level manifests only, no recursive walk."""

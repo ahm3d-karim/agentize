@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 # --------------------------------------------------------------------------
 # terminal styling — zero-dep ANSI; inert when piped or NO_COLOR
@@ -76,6 +76,24 @@ def _enable_windows_vt() -> None:
 
 
 _enable_windows_vt()
+
+
+def _utf8_stdio() -> None:
+    """UTF-8 for piped stdout/stderr with lossy fallback. Windows pipes
+    default to the ANSI codepage (cp1252), and ok()/err() emit ✓/✗/—
+    (U+2713/U+2717/U+2014) which cp1252 cannot encode — a UnicodeEncodeError
+    crash on any piped run (CI, git-bash, cron). Consoles are left alone
+    (they use WriteConsoleW and already handle Unicode)."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream.isatty():
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+_utf8_stdio()
 
 
 def _s(code: str, s: str) -> str:
