@@ -1516,7 +1516,11 @@ def menu_selected_repo() -> int:
         print(dim(f"  Selected: {root}"))
     print(dim(f"Scanning {root.name}…"), file=sys.stderr)
     t0 = time.monotonic()
-    md = render(analyze(root))
+    ev = analyze(root)
+    if (root / ".git").exists():
+        since, authors = ask_history_defaults()
+        ev["recent"] = (since, git_recent(root, since, authors))
+    md = render(ev)
     if write_agents_md(root, md):
         print(ok(f"Done — {time.monotonic() - t0:.1f}s"))
     return 0
