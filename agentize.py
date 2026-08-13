@@ -1480,9 +1480,11 @@ def pick_local_repo(base: Path | None = None) -> Path:
         if depth >= 3:
             dirnames[:] = []
             continue
-        # .git must be detected BEFORE pruning (it's in PRUNE_DIRS)
+        # .git must be detected BEFORE pruning (it's in PRUNE_DIRS);
+        # skip base — it is always in `found` already
         if ".git" in dirnames:
-            found.append(Path(dirpath))
+            if Path(dirpath).resolve() != base:
+                found.append(Path(dirpath).resolve())
             dirnames.remove(".git")
         dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
     found.sort(key=lambda p: (p != base, str(p).lower()))

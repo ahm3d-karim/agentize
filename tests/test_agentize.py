@@ -556,6 +556,27 @@ class TestHistoryAndBootstrap(unittest.TestCase):
             agentize.CONFIG_PATH = orig_cfg
             builtins.input = old_input
 
+    def test_pick_local_repo_no_duplicate_entry(self):
+        """Running from inside a repo must list it once (regression:
+        base + .git-discovery used to duplicate the current repo)."""
+        import builtins
+        old_cwd, old_input = os.getcwd(), builtins.input
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+                repo = pathlib.Path(d) / "r"
+                repo.mkdir()
+                subprocess.run(["git", "init", "-q", str(repo)], check=True)
+                os.chdir(repo)
+                def _no_prompt(_prompt=""):
+                    raise AssertionError("single-repo case must not prompt")
+                builtins.input = _no_prompt
+                picked = agentize.pick_local_repo()
+                # compare canonical forms — Windows 8.3 short vs long path
+                self.assertEqual(picked.resolve(), repo.resolve())
+        finally:
+            os.chdir(old_cwd)
+            builtins.input = old_input
+
     def test_ask_history_defaults(self):
         old_input = builtins.input
         try:
