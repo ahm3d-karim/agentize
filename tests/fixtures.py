@@ -123,6 +123,41 @@ A fake Python training package used to test agentize.
 
 Install with `uv sync`, then run `uv run train --config configs/base.yaml`.
 """,
+    "fixture_monorepo/pnpm-workspace.yaml": "packages:\n  - \"packages/*\"\n",
+    "fixture_monorepo/README.md": """\
+# Fixture Monorepo
+
+A fake pnpm monorepo with two packages under `packages/`.
+""",
+    "fixture_monorepo/packages/a/package.json": """\
+{
+  "name": "pkg-a",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build"
+  },
+  "dependencies": {
+    "react": "^19.0.0"
+  }
+}
+""",
+    "fixture_monorepo/packages/b/package.json": """\
+{
+  "name": "pkg-b",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -b"
+  }
+}
+""",
+    "fixture_monorepo/packages/c/README.md": """\
+# pkg-c
+
+A directory without a package.json — must be excluded from workspaces.
+""",
 }
 
 

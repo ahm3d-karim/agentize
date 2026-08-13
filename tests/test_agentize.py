@@ -168,6 +168,105 @@ class TestLifecycle(unittest.TestCase):
         self.assertTrue((self.web / ".cursorrules").exists())
 
 
+class TestCheckMode(unittest.TestCase):
+    """--check: verify AGENTS.md matches the render; never writes, exit codes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.web = materialize("fixture_web", pathlib.Path(self.tmp.name))
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_fresh_generated_file_passes(self):
+        r = run_cli(str(self.web))
+        self.assertEqual(r.returncode, 0)
+        r = run_cli(str(self.web), "--check")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("AGENTS.md is up to date", r.stdout)
+
+    def test_out_of_date_fails(self):
+        run_cli(str(self.web))
+        (self.web / "AGENTS.md").write_text(
+            "# fixture-web\n\nstale — no longer matches the render\n",
+            encoding="utf-8")
+        r = run_cli(str(self.web), "--check")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("AGENTS.md", r.stderr)
+        self.assertIn("out of date", r.stderr)
+        self.assertIn("lines differ", r.stderr)
+
+    def test_missing_fails_without_writing(self):
+        r = run_cli(str(self.web), "--check")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("missing", r.stderr)
+        # --check must never create the file
+        self.assertFalse((self.web / "AGENTS.md").exists())
+
+    def test_claude_and_cursor_checked_too(self):
+        run_cli(str(self.web), "--claude", "--cursor", "--force")
+        r = run_cli(str(self.web), "--check", "--claude", "--cursor")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("AGENTS.md is up to date", r.stdout)
+        self.assertIn("CLAUDE.md is up to date", r.stdout)
+        self.assertIn(".cursorrules is up to date", r.stdout)
+        (self.web / "CLAUDE.md").write_text("stale\n", encoding="utf-8")
+        r = run_cli(str(self.web), "--check", "--claude", "--cursor")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CLAUDE.md", r.stderr)
+        self.assertIn("out of date", r.stderr)
+
+
+class TestMonorepoWorkspaces(unittest.TestCase):
+    """pnpm workspaces: root listing + a nested AGENTS.md per package."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mono = materialize("fixture_monorepo", pathlib.Path(self.tmp.name))
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_analyze_detects_workspaces(self):
+        ws = agentize.analyze(self.mono)["workspaces"]
+        self.assertEqual([w["path"].as_posix() for w in ws],
+                         ["packages/a", "packages/b"])
+        self.assertEqual([w["name"] for w in ws], ["pkg-a", "pkg-b"])
+        # packages/c has no package.json — glob hit without a manifest
+        self.assertNotIn("c", [w["name"] for w in ws])
+
+    def test_render_lists_workspaces(self):
+        md = agentize.render(agentize.analyze(self.mono))
+        self.assertIn("## Workspaces", md)
+        self.assertIn("- `packages/a/` — pkg-a", md)
+        self.assertIn("- `packages/b/` — pkg-b", md)
+        self.assertNotIn("packages/c", md)
+        # the section sits right after Project structure
+        self.assertLess(md.index("## Project structure"), md.index("## Workspaces"))
+
+    def test_cli_writes_nested_agents_md(self):
+        r = run_cli(str(self.mono))
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.mono / "AGENTS.md").exists())
+        a_md = (self.mono / "packages" / "a" / "AGENTS.md").read_text(encoding="utf-8")
+        b_md = (self.mono / "packages" / "b" / "AGENTS.md").read_text(encoding="utf-8")
+        # each package's file carries its own scripts
+        self.assertIn("next dev", a_md)
+        self.assertIn("tsc -b", b_md)
+        # c is not a package — no nested file for it
+        self.assertFalse((self.mono / "packages" / "c" / "AGENTS.md").exists())
+
+    def test_check_passes_after_generation(self):
+        run_cli(str(self.mono))
+        r = run_cli(str(self.mono), "--check")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("AGENTS.md is up to date", r.stdout)
+
+    def test_check_fails_after_tampering(self):
+        run_cli(str(self.mono))
+        (self.mono / "packages" / "a" / "AGENTS.md").write_text(
+            "# tampered\n\nno longer matches the render\n", encoding="utf-8")
+        r = run_cli(str(self.mono), "--check")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("out of date", r.stderr)
+
+
 class TestGithubHelpers(unittest.TestCase):
     """Pure logic of --github mode: selection parsing, filters, config."""
 

@@ -13,6 +13,7 @@ Usage:
     agentize [PATH] --claude        # also write CLAUDE.md
     agentize [PATH] --cursor        # also write .cursorrules
     agentize [PATH] --force         # overwrite an existing AGENTS.md
+    agentize [PATH] --check         # verify AGENTS.md is up to date (never writes)
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # --------------------------------------------------------------------------
 # terminal styling — zero-dep ANSI; inert when piped or NO_COLOR
@@ -628,6 +629,14 @@ def render(ev: dict) -> str:
             L.append(f"- `{n}` — {r}")
         L.append("")
 
+    # ---- workspaces (monorepo packages)
+    if ev.get("workspaces"):
+        L.append("## Workspaces")
+        L.append("")
+        for ws in ev["workspaces"]:
+            L.append(f"- `{ws['path'].as_posix()}/` — {ws['name']}")
+        L.append("")
+
     # ---- env vars
     if ev.get("env"):
         L.append("## Environment variables")
@@ -680,10 +689,98 @@ def render(ev: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# monorepo workspaces
+# --------------------------------------------------------------------------
+
+def _npm_workspace_globs(root: Path) -> list[str]:
+    """Glob patterns from package.json 'workspaces' — an array of globs, or
+    an object with a 'packages' array (npm/yarn/bun style)."""
+    p = root / "package.json"
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(read_small(p) or "{}")
+    except json.JSONDecodeError:
+        return []
+    ws = data.get("workspaces")
+    if isinstance(ws, list):
+        return [w for w in ws if isinstance(w, str)]
+    if isinstance(ws, dict):
+        pkgs = ws.get("packages")
+        if isinstance(pkgs, list):
+            return [w for w in pkgs if isinstance(w, str)]
+    return []
+
+
+def _pnpm_workspace_globs(root: Path) -> list[str]:
+    """Glob patterns from pnpm-workspace.yaml's 'packages:' list. Parsed
+    with a tiny subset (top-level key + '- item' lines) — no YAML dep."""
+    p = root / "pnpm-workspace.yaml"
+    if not p.exists():
+        return []
+    out: list[str] = []
+    in_packages = False
+    for line in (read_small(p) or "").splitlines():
+        s = line.strip()
+        if s == "packages:":
+            in_packages = True
+            continue
+        if not in_packages:
+            continue
+        if s.startswith("- "):
+            item = s[2:].strip().strip("\"'")
+            if item:
+                out.append(item)
+        elif s and not s.startswith("#"):
+            in_packages = False  # next top-level key
+    return out
+
+
+def detect_workspaces(root: Path) -> list[dict]:
+    """Workspace package dirs declared by the root repo, as {name, path}.
+
+    Reads package.json 'workspaces' (array or {'packages': [...]}) and
+    pnpm-workspace.yaml 'packages'. Only simple globs ('*', 'packages/*',
+    'apps/*') are expanded — globs containing '**' and negations starting
+    with '!' are skipped. A glob hit qualifies only when it is an existing
+    directory carrying its own package.json (a dir without a manifest,
+    e.g. a docs folder, is excluded). Sorted by path, capped at 25.
+    'path' is relative to root; 'name' is the package.json name with the
+    directory name as fallback."""
+    globs = _npm_workspace_globs(root) + _pnpm_workspace_globs(root)
+    found: dict[str, Path] = {}
+    for g in globs:
+        g = g.strip()
+        if not g or g.startswith("!") or "**" in g:
+            continue
+        for d in root.glob(g.rstrip("/")):
+            if not d.is_dir() or d.name in PRUNE_DIRS:
+                continue
+            if not (d / "package.json").is_file():
+                continue  # glob hit without a manifest is not a package
+            found[rel(root, d)] = d
+    out = []
+    for relp in sorted(found):
+        d = found[relp]
+        name = d.name
+        try:
+            pkg = json.loads(read_small(d / "package.json") or "{}")
+            if isinstance(pkg.get("name"), str) and pkg["name"]:
+                name = pkg["name"]
+        except json.JSONDecodeError:
+            pass
+        out.append({"name": name, "path": Path(relp)})
+    return out[:25]
+
+
+# --------------------------------------------------------------------------
 # orchestration
 # --------------------------------------------------------------------------
 
-def analyze(root: Path) -> dict:
+def analyze(root: Path, nested: bool = False) -> dict:
+    """Extract everything agentize knows about root. nested=True marks an
+    analysis of a workspace package: its own workspaces are NOT detected,
+    so workspace generation never recurses deeper than one level."""
     files = walk_repo(root)
     stack = detect_stack(root, files)
 
@@ -746,6 +843,7 @@ def analyze(root: Path) -> dict:
         "pitfalls": contributing_bullets(root),
         "conventions": detect_commit_conventions(root),
         "test_cmd": test_cmd,
+        "workspaces": [] if nested else detect_workspaces(root),
     }
     return ev
 
@@ -1323,6 +1421,7 @@ Usage:
   agentize [PATH] --claude     also write CLAUDE.md
   agentize [PATH] --cursor     also write .cursorrules
   agentize [PATH] --force      overwrite an existing AGENTS.md
+  agentize [PATH] --check      verify AGENTS.md is up to date (exit 1 if stale/missing)
   agentize [PATH] --since 3d   include commit history (git ref, default yesterday)
   agentize [PATH] --authors a,b
   agentize --json              dump extracted evidence as JSON
@@ -1454,6 +1553,58 @@ def write_agents_md(root: Path, md: str) -> bool:
     target.write_text(md + "\n", encoding="utf-8")
     print(ok(f"  wrote {target}"))
     return True
+
+
+def verify_agents_md(root: Path, md: str, extra: list[str] | None = None) -> int:
+    """--check: compare freshly rendered md against files on disk; never writes.
+    extra: additional filenames to verify (CLAUDE.md, .cursorrules).
+    Returns 0 when every file matches the render, 1 otherwise."""
+    targets = ["AGENTS.md"] + list(extra or [])
+    expected = _normalize_newlines(md + "\n")
+    fails = 0
+    for filename in targets:
+        path = root / filename
+        if not path.exists():
+            print(err(f"agentize: {filename} is missing — run agentize to generate it"),
+                  file=sys.stderr)
+            fails += 1
+            continue
+        actual = _normalize_newlines(path.read_text(encoding="utf-8"))
+        if actual == expected:
+            print(ok(f"agentize: {filename} is up to date"))
+            continue
+        exp_lines, got_lines = expected.splitlines(), actual.splitlines()
+        n = sum(1 for a, b in zip(exp_lines, got_lines) if a != b) \
+            + abs(len(exp_lines) - len(got_lines))
+        print(err(f"agentize: {filename} is out of date — {n} lines differ "
+                  f"(run agentize to regenerate)"), file=sys.stderr)
+        fails += 1
+    return 1 if fails else 0
+
+
+def _normalize_newlines(s: str) -> str:
+    """CRLF/CR → LF so comparisons are portable across platforms."""
+    return s.replace(chr(13) + "\n", "\n").replace(chr(13), "\n")
+
+
+def _write_rendered(root: Path, md: str, args) -> int:
+    """CLI write path: AGENTS.md (+CLAUDE.md/.cursorrules with --claude/
+    --cursor) into root, honoring --force. Returns files written."""
+    targets = [("AGENTS.md", root / "AGENTS.md")]
+    if args.claude:
+        targets.append(("CLAUDE.md", root / "CLAUDE.md"))
+    if args.cursor:
+        targets.append((".cursorrules", root / ".cursorrules"))
+    written = 0
+    for label, path in targets:
+        if path.exists() and not args.force:
+            print(warn(f"agentize: {label} exists — run bare 'agentize' for the menu, "
+                       f"--force to overwrite, or --stdout to preview."), file=sys.stderr)
+            continue
+        path.write_text(md + "\n", encoding="utf-8")
+        print(ok(f"agentize: wrote {path}"))
+        written += 1
+    return written
 
 
 def menu_local_generate() -> int:
@@ -1614,6 +1765,9 @@ def main() -> int:
                     help="generate locally but don't push or open PRs")
     ap.add_argument("--notify", choices=["none", "discord"], default="none",
                     help="notify when done (discord needs DISCORD_BOT_TOKEN + DISCORD_HOME_CHANNEL)")
+    ap.add_argument("--check", action="store_true",
+                    help="verify AGENTS.md matches the generated render; exit 1 if "
+                         "stale or missing (never writes)")
     ap.add_argument("--llm", action="store_true",
                     help="polish the output with an LLM (bring your own key)")
     ap.add_argument("--provider", metavar="NAME",
@@ -1652,31 +1806,33 @@ def main() -> int:
 
     md = render(ev)
 
+    if args.check:
+        extra = []
+        if args.claude:
+            extra.append("CLAUDE.md")
+        if args.cursor:
+            extra.append(".cursorrules")
+        code = verify_agents_md(root, md, extra)
+        for ws in ev.get("workspaces") or []:
+            ws_root = root / ws["path"]
+            ws_md = render(analyze(ws_root, nested=True))
+            code = max(code, verify_agents_md(ws_root, ws_md, extra))
+        return code
+
     if args.json:
         # strip non-serializable bits
         print(json.dumps(ev, indent=2, default=str))
         return 0
 
-    targets = []
     if args.stdout:
         print(md)
         return 0
 
-    targets.append(("AGENTS.md", root / "AGENTS.md"))
-    if args.claude:
-        targets.append(("CLAUDE.md", root / "CLAUDE.md"))
-    if args.cursor:
-        targets.append((".cursorrules", root / ".cursorrules"))
-
-    written = 0
-    for label, path in targets:
-        if path.exists() and not args.force:
-            print(warn(f"agentize: {label} exists — run bare 'agentize' for the menu, "
-                       f"--force to overwrite, or --stdout to preview."), file=sys.stderr)
-            continue
-        path.write_text(md + "\n", encoding="utf-8")
-        print(ok(f"agentize: wrote {path}"))
-        written += 1
+    written = _write_rendered(root, md, args)
+    for ws in ev.get("workspaces") or []:
+        ws_root = root / ws["path"]
+        ws_md = render(analyze(ws_root, nested=True))
+        written += _write_rendered(ws_root, ws_md, args)
     if written:
         print(ok(f"Done — {written} file(s) in {time.monotonic() - t0:.1f}s"))
 

@@ -151,6 +151,27 @@ from inventing anything.** The interactive menu has it as option 4.
 | Project structure map | top-level dirs with role heuristics |
 | Gotchas & PR rules | `CONTRIBUTING.md` sections |
 
+## Testing
+
+```bash
+python -m unittest discover -s tests
+```
+
+**CI:** the suite runs on **Linux and Windows** via GitHub Actions on every
+push and pull request.
+
+## Publishing
+
+Maintainers ship a release from the repo root with:
+
+```bash
+uv build
+uv publish
+```
+
+The wheel is **dependency-free** — agentize uses only the Python standard
+library, so the published wheel has zero runtime dependencies.
+
 ## Roadmap
 
 - [x] GitHub mode: connect, pick repos, PR AGENTS.md each (v0.2)
