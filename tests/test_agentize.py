@@ -31,6 +31,76 @@ def run_cli(*args):
                           capture_output=True, text=True)
 
 
+class TestCiExtraction(unittest.TestCase):
+    """extract_ci style-agnosticism: bare run:, pipe blocks, templates."""
+
+    def _wf(self, body):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        d = root / ".github" / "workflows"
+        d.mkdir(parents=True)
+        (d / "ci.yml").write_text(body, encoding="utf-8")
+        return root
+
+    def test_bare_run_and_dash_run_both_mined(self):
+        root = self._wf("""
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test
+      - name: Lint
+        run: npm run lint
+""")
+        cmds = [c["cmd"] for c in agentize.extract_ci(root)]
+        self.assertIn("npm test", cmds)
+        self.assertIn("npm run lint", cmds)
+
+    def test_pipe_block_joins_lines(self):
+        root = self._wf("""
+jobs:
+  smoke:
+    steps:
+      - name: Install + smoke
+        run: |
+          python -m venv venv
+          venv/bin/python -m pip install -q .
+          venv/bin/agentize --version
+""")
+        cmds = [c["cmd"] for c in agentize.extract_ci(root)]
+        self.assertEqual(len(cmds), 1)
+        self.assertIn("python -m venv venv && venv/bin/python -m pip install -q .", cmds[0])
+
+    def test_literal_pipe_marker_never_mined(self):
+        root = self._wf("""
+jobs:
+  x:
+    steps:
+      - run: |
+          echo hi
+""")
+        cmds = [c["cmd"] for c in agentize.extract_ci(root)]
+        self.assertTrue(all(c != "|" for c in cmds))
+
+    def test_template_placeholders_skipped(self):
+        root = self._wf("""
+jobs:
+  x:
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - run: python -m pip wheel . -w dist
+      - run: python -m pip install ${{ matrix.python }}.0
+""")
+        cmds = [c["cmd"] for c in agentize.extract_ci(root)]
+        self.assertIn("python -m pip wheel . -w dist", cmds)
+        self.assertTrue(all("${{" not in c for c in cmds))
+
+
 class TestExtractionWeb(unittest.TestCase):
     """The JS/TS fixture: every command must be real and sourced."""
 
@@ -185,14 +255,89 @@ class TestCheckMode(unittest.TestCase):
 
     def test_out_of_date_fails(self):
         run_cli(str(self.web))
-        (self.web / "AGENTS.md").write_text(
-            "# fixture-web\n\nstale — no longer matches the render\n",
-            encoding="utf-8")
+        # tamper INSIDE the managed block — the region agentize owns
+        p = self.web / "AGENTS.md"
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text.replace("**Stack:**", "**Stack:** (tampered)"), encoding="utf-8")
         r = run_cli(str(self.web), "--check")
         self.assertEqual(r.returncode, 1)
         self.assertIn("AGENTS.md", r.stderr)
         self.assertIn("out of date", r.stderr)
         self.assertIn("lines differ", r.stderr)
+
+    def test_legacy_file_without_markers_fails(self):
+        # a hand-written AGENTS.md (no agentize markers) is not verifiable
+        (self.web / "AGENTS.md").write_text(
+            "# fixture-web\n\nhand-written, no markers\n", encoding="utf-8")
+        r = run_cli(str(self.web), "--check")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("markers", r.stderr)
+
+    def test_human_edit_outside_block_passes(self):
+        run_cli(str(self.web))
+        p = self.web / "AGENTS.md"
+        text = p.read_text(encoding="utf-8")
+        p.write_text("## My team's notes\n\nkeep these!\n\n" + text, encoding="utf-8")
+        r = run_cli(str(self.web), "--check")
+        self.assertEqual(r.returncode, 0)  # human notes above the block = fine
+
+    def test_update_regenerates_in_place(self):
+        run_cli(str(self.web))
+        p = self.web / "AGENTS.md"
+        text = p.read_text(encoding="utf-8")
+        p.write_text("## Human header\n\n" + text.replace("**Stack:**", "**Stack:** (stale)"),
+                     encoding="utf-8")
+        r = run_cli(str(self.web), "--check", "--update")
+        self.assertEqual(r.returncode, 1)  # changed something
+        new = p.read_text(encoding="utf-8")
+        self.assertIn("## Human header", new)      # human content preserved
+        self.assertNotIn("(stale)", new)           # block regenerated
+        r2 = run_cli(str(self.web), "--check", "--update")
+        self.assertEqual(r2.returncode, 0)         # second pass: clean
+
+    def test_diff_shows_changes(self):
+        run_cli(str(self.web))
+        p = self.web / "AGENTS.md"
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text.replace("**Stack:**", "**Stack:** (changed)"), encoding="utf-8")
+        r = run_cli(str(self.web), "--diff")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("+", r.stdout)
+        # after --update the diff is empty
+        run_cli(str(self.web), "--check", "--update")
+        r3 = run_cli(str(self.web), "--diff")
+        self.assertEqual(r3.returncode, 0)
+
+    def test_verify_reports_stale_claim(self):
+        run_cli(str(self.web))
+        p = self.web / "AGENTS.md"
+        text = p.read_text(encoding="utf-8")
+        # inject a claim that is NOT derivable from the repo
+        p.write_text(text.replace(
+            "## Command reference (sources)",
+            "| `totally-made-up-cmd` | not real | nowhere |\n\n## Command reference (sources)"),
+            encoding="utf-8")
+        r = run_cli(str(self.web), "--verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("stale", r.stderr)
+
+    def test_verify_passes_on_clean_file(self):
+        run_cli(str(self.web))
+        r = run_cli(str(self.web), "--verify")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("verified", r.stdout)
+
+    def test_explain_finds_command(self):
+        run_cli(str(self.web))
+        r = run_cli(str(self.web), "--explain", "npm run build")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("source", r.stdout)
+
+    def test_explain_unknown_command_fails(self):
+        run_cli(str(self.web))
+        r = run_cli(str(self.web), "--explain", "no-such-command-xyz")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no evidence", r.stderr)
 
     def test_missing_fails_without_writing(self):
         r = run_cli(str(self.web), "--check")
@@ -465,8 +610,14 @@ class TestLlmPolish(unittest.TestCase):
               "roles": {}, "description": "readme says this",
               "ai_overview": "the model says this", "commands": []}
         md = agentize.render(ev)
-        self.assertIn("the model says this", md)
-        self.assertNotIn("readme says this", md)
+        # AI overview is volatile prose — sits ABOVE the managed block
+        self.assertLess(md.index("the model says this"),
+                        md.index(agentize.AGENTIZE_START))
+        # evidence description stays inside the deterministic block
+        self.assertIn("readme says this", md)
+        self.assertIn(agentize.AGENTIZE_START, md)
+        self.assertIn(agentize.AGENTIZE_END, md)
+        self.assertIn("fingerprint", md)
 
     def test_polish_offline_default(self):
         ev = {"name": "x"}
