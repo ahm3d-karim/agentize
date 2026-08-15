@@ -174,6 +174,7 @@ PRUNE_DIRS = {
     ".tox", ".eggs", ".idea", ".vscode", ".yarn", ".pnpm-store", ".serverless",
     ".vercel", ".expo", ".terraform", ".gitlab", "site-packages", ".docusaurus",
     ".storybook-static", "cdk.out", "AppData", ".hermes", ".local",
+    ".cursor",  # agentize writes .cursor/rules/*.mdc — tool output, not structure
 }
 
 PRUNE_SUFFIXES = {".egg-info", ".pyc", ".png", ".jpg", ".jpeg", ".gif", ".svg",
@@ -719,6 +720,15 @@ def render(ev: dict) -> str:
                  + ", ".join(f"`{k}`" for k in ev["env"]))
         L.append("")
 
+    # ---- MCP servers (extracted from .mcp.json / .cursor/mcp.json)
+    if ev.get("mcp"):
+        L.append("## MCP servers")
+        L.append("")
+        for srv in ev["mcp"][:8]:
+            hint = f" — `{srv['cmd']}`" if srv["cmd"] else ""
+            L.append(f"- `{srv['name']}`{hint} ({srv['source']})")
+        L.append("")
+
     # ---- pitfalls / contribution rules
     if ev.get("pitfalls"):
         L.append("## Gotchas")
@@ -889,6 +899,32 @@ def detect_workspaces(root: Path) -> list[dict]:
 # orchestration
 # --------------------------------------------------------------------------
 
+def extract_mcp_servers(root: Path) -> list[dict]:
+    """MCP server names + launch hints from .mcp.json / .cursor/mcp.json.
+    Purely extractive: keys and command/env from the manifest, nothing
+    invented. Returns [{'name', 'cmd', 'source'}]."""
+    out = []
+    for p in (root / ".mcp.json", root / ".cursor" / "mcp.json"):
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(read_small(p) or "{}")
+        except json.JSONDecodeError:
+            continue
+        servers = data.get("mcpServers") or {}
+        for name, cfg in servers.items():
+            if not isinstance(cfg, dict):
+                continue
+            cmd = cfg.get("command") or cfg.get("url") or ""
+            if isinstance(cmd, list):
+                cmd = " ".join(str(x) for x in cmd)
+            if isinstance(cfg.get("args"), list):
+                cmd = f"{cmd} {' '.join(str(a) for a in cfg['args'])}".strip()
+            out.append({"name": name, "cmd": cmd,
+                        "source": rel(root, p)})
+    return out
+
+
 def analyze(root: Path, nested: bool = False) -> dict:
     """Extract everything agentize knows about root. nested=True marks an
     analysis of a workspace package: its own workspaces are NOT detected,
@@ -951,6 +987,7 @@ def analyze(root: Path, nested: bool = False) -> dict:
         "roles": roles,
         "description": readme_description(root, files),
         "env": extract_env_example(root),
+        "mcp": extract_mcp_servers(root),
         "structure": structure_map(root, files),
         "pitfalls": contributing_bullets(root),
         "conventions": detect_commit_conventions(root),
@@ -1582,7 +1619,10 @@ Usage:
   agentize [PATH]              write AGENTS.md for a local folder (default: .)
   agentize [PATH] --stdout     preview without writing
   agentize [PATH] --claude     also write CLAUDE.md
-  agentize [PATH] --cursor     also write .cursorrules
+  agentize [PATH] --cursor     also write .cursor/rules/agentize.mdc (Cursor)
+  agentize [PATH] --gemini     also write GEMINI.md
+  agentize [PATH] --all        write every format (AGENTS.md + CLAUDE.md + GEMINI.md + .mdc)
+  agentize [PATH] --install-hook      install a pre-commit hook (blocks on stale AGENTS.md)
   agentize [PATH] --force      overwrite an existing AGENTS.md
   agentize [PATH] --check      verify AGENTS.md is up to date (exit 1 if stale/missing)
   agentize [PATH] --check --update   regenerate managed block in place (exit 1 if changed)
@@ -1894,15 +1934,77 @@ def _normalize_newlines(s: str) -> str:
     return s.replace(chr(13) + "\n", "\n").replace(chr(13), "\n")
 
 
+def _mdc_render(md: str, name: str) -> str:
+    """Cursor rule (.mdc) wrapper: YAML frontmatter + the managed markdown.
+    .cursorrules is deprecated by Cursor in favor of .cursor/rules/*.mdc."""
+    title = next((ln.lstrip("# ").strip() for ln in md.splitlines()
+                  if ln.startswith("# ") and not ln.startswith("## ")), name)
+    return (f"---\ndescription: {title}\nglobs: \"**/*\"\nalwaysApply: true\n---\n\n"
+            + md)
+
+
+def _write_format(root: Path, filename: str, content: str, args) -> int:
+    """Write one derived format file (GEMINI.md, .cursor/rules/*.mdc) with
+    the same force/exists semantics as AGENTS.md. Returns 1 when written."""
+    path = root / filename
+    if path.exists() and not args.force:
+        print(warn(f"agentize: {filename} exists — --force to overwrite."), file=sys.stderr)
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    print(ok(f"agentize: wrote {path}"))
+    return 1
+
+
+def install_hook(root: Path) -> int:
+    """install-hook: write .git/hooks/pre-commit running `agentize --check`
+    on the repo. Idempotent — refuses to overwrite a non-agentize hook."""
+    hooks = root / ".git" / "hooks"
+    if not hooks.is_dir():
+        print(err(f"agentize: {root} is not a git repo (no .git/hooks)"),
+              file=sys.stderr)
+        return 1
+    hook = hooks / "pre-commit"
+    marker = "# managed by agentize install-hook"
+    if hook.exists():
+        text = hook.read_text(encoding="utf-8", errors="replace")
+        if marker in text:
+            print(ok(f"agentize: pre-commit hook already installed ({hook})"))
+            return 0
+        print(err(f"agentize: {hook} exists and is not agentize-managed — "
+                  f"refusing to overwrite"), file=sys.stderr)
+        return 1
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"{marker}\n"
+        "# Blocks commits when AGENTS.md is stale — regenerate with:\n"
+        "#   agentize . --check --update\n"
+        'if ! command -v agentize >/dev/null 2>&1; then\n'
+        '  echo "agentize: not found — skipping pre-commit AGENTS.md check" >&2\n'
+        '  exit 0\n'
+        "fi\n"
+        'agentize . --check >/dev/null 2>&1 || {\n'
+        '  echo "AGENTS.md is out of date — run: agentize . --check --update" >&2\n'
+        "  exit 1\n"
+        "}\n",
+        encoding="utf-8")
+    hook.chmod(hook.stat().st_mode | 0o111)
+    print(ok(f"agentize: installed pre-commit hook ({hook})"))
+    return 0
+
+
 def _write_rendered(root: Path, md: str, args) -> int:
-    """CLI write path: AGENTS.md (+CLAUDE.md/.cursorrules with --claude/
-    --cursor) into root, honoring --force. Regeneration preserves human
-    content above/below the managed block. Returns files written."""
+    """CLI write path: AGENTS.md (+CLAUDE.md with --claude, .cursor/rules/
+    agentize.mdc with --cursor, GEMINI.md with --gemini, all with --all)
+    into root, honoring --force. Regeneration preserves human content
+    above/below the managed block. Returns files written."""
     targets = [("AGENTS.md", root / "AGENTS.md")]
-    if args.claude:
+    if args.claude or args.all:
         targets.append(("CLAUDE.md", root / "CLAUDE.md"))
-    if args.cursor:
-        targets.append((".cursorrules", root / ".cursorrules"))
+    if args.cursor or args.all:
+        targets.append((".cursor/rules/agentize.mdc", root / ".cursor" / "rules" / "agentize.mdc"))
+    if args.gemini or args.all:
+        targets.append(("GEMINI.md", root / "GEMINI.md"))
     written = 0
     for label, path in targets:
         if path.exists() and not args.force:
@@ -1910,12 +2012,15 @@ def _write_rendered(root: Path, md: str, args) -> int:
                        f"--force to overwrite, or --stdout to preview."), file=sys.stderr)
             continue
         content = md + "\n"
+        if label.endswith(".mdc"):
+            content = _mdc_render(md, root.name) + "\n"
         if path.exists():
             before, block, after = _split_managed(
                 _normalize_newlines(path.read_text(encoding="utf-8")))
             if block is not None:
                 # preserve human notes above the start marker + below the end marker
-                content = before + _normalize_newlines(md) + "\n" + after
+                content = before + _normalize_newlines(content) + "\n" + after
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         print(ok(f"agentize: wrote {path}"))
         written += 1
@@ -2067,8 +2172,14 @@ def main() -> int:
                     help="repo root (default: current dir)")
     ap.add_argument("--stdout", action="store_true", help="print instead of writing files")
     ap.add_argument("--claude", action="store_true", help="also write CLAUDE.md")
-    ap.add_argument("--cursor", action="store_true", help="also write .cursorrules")
+    ap.add_argument("--cursor", action="store_true",
+                    help="also write .cursor/rules/agentize.mdc (Cursor's current rule format)")
+    ap.add_argument("--gemini", action="store_true", help="also write GEMINI.md")
+    ap.add_argument("--all", action="store_true",
+                    help="write every format: AGENTS.md, CLAUDE.md, GEMINI.md, .cursor rule")
     ap.add_argument("--force", action="store_true", help="overwrite existing AGENTS.md")
+    ap.add_argument("--install-hook", action="store_true",
+                    help="install a pre-commit hook that blocks on stale AGENTS.md")
     ap.add_argument("--json", action="store_true", help="dump the extracted evidence as JSON")
     ap.add_argument("--github", action="store_true",
                     help="GitHub mode: pick repos from your account, generate AGENTS.md, open PRs")
@@ -2127,6 +2238,9 @@ def main() -> int:
     if args.since:
         ev = attach_recent(ev, root, args.since, args.authors)
 
+    if args.install_hook:
+        return install_hook(root)
+
     md = render(ev)
 
     def workspace_renders():
@@ -2134,6 +2248,17 @@ def main() -> int:
         for ws in ev.get("workspaces") or []:
             ws_root = root / ws["path"]
             yield ws_root, render(analyze(ws_root, nested=True))
+
+    def extra_files() -> list[str]:
+        """Additional format files to write/check alongside AGENTS.md."""
+        extra = []
+        if args.claude or args.all:
+            extra.append("CLAUDE.md")
+        if args.cursor or args.all:
+            extra.append(".cursor/rules/agentize.mdc")
+        if args.gemini or args.all:
+            extra.append("GEMINI.md")
+        return extra
 
     if args.explain:
         return explain_command(root, ev, args.explain)
@@ -2151,11 +2276,7 @@ def main() -> int:
         return code
 
     if args.check:
-        extra = []
-        if args.claude:
-            extra.append("CLAUDE.md")
-        if args.cursor:
-            extra.append(".cursorrules")
+        extra = extra_files()
         if args.update:
             code = update_agents_md(root, md, extra)
             for ws_root, ws_md in workspace_renders():

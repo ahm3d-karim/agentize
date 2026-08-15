@@ -235,7 +235,21 @@ class TestLifecycle(unittest.TestCase):
     def test_claude_and_cursor(self):
         run_cli(str(self.web), "--claude", "--cursor", "--force")
         self.assertTrue((self.web / "CLAUDE.md").exists())
-        self.assertTrue((self.web / ".cursorrules").exists())
+        # --cursor writes Cursor's current rule format (.mdc), not the
+        # deprecated .cursorrules
+        mdc = self.web / ".cursor" / "rules" / "agentize.mdc"
+        self.assertTrue(mdc.exists())
+        self.assertIn("description:", mdc.read_text(encoding="utf-8"))
+        self.assertIn("alwaysApply: true", mdc.read_text(encoding="utf-8"))
+        self.assertFalse((self.web / ".cursorrules").exists())
+
+    def test_gemini_and_all(self):
+        run_cli(str(self.web), "--gemini", "--force")
+        self.assertTrue((self.web / "GEMINI.md").exists())
+        run_cli(str(self.web), "--all", "--force")
+        self.assertTrue((self.web / "CLAUDE.md").exists())
+        self.assertTrue((self.web / "GEMINI.md").exists())
+        self.assertTrue((self.web / ".cursor" / "rules" / "agentize.mdc").exists())
 
 
 class TestCheckMode(unittest.TestCase):
@@ -352,12 +366,60 @@ class TestCheckMode(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("AGENTS.md is up to date", r.stdout)
         self.assertIn("CLAUDE.md is up to date", r.stdout)
-        self.assertIn(".cursorrules is up to date", r.stdout)
+        self.assertIn("agentize.mdc is up to date", r.stdout)
         (self.web / "CLAUDE.md").write_text("stale\n", encoding="utf-8")
         r = run_cli(str(self.web), "--check", "--claude", "--cursor")
         self.assertEqual(r.returncode, 1)
         self.assertIn("CLAUDE.md", r.stderr)
         self.assertIn("out of date", r.stderr)
+
+
+class TestHookAndMcp(unittest.TestCase):
+    """install-hook + MCP server hints."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.web = materialize("fixture_web", pathlib.Path(self.tmp.name))
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_install_hook_writes_pre_commit(self):
+        (self.web / ".git").mkdir(exist_ok=True)
+        (self.web / ".git" / "hooks").mkdir(exist_ok=True)
+        r = run_cli(str(self.web), "--install-hook")
+        self.assertEqual(r.returncode, 0)
+        hook = self.web / ".git" / "hooks" / "pre-commit"
+        self.assertTrue(hook.exists())
+        text = hook.read_text(encoding="utf-8")
+        self.assertIn("agentize . --check", text)
+        # idempotent
+        r2 = run_cli(str(self.web), "--install-hook")
+        self.assertEqual(r2.returncode, 0)
+        self.assertIn("already installed", r2.stdout)
+        # refuses to overwrite a foreign hook
+        hook.write_text("#!/bin/sh\necho custom\n", encoding="utf-8")
+        r3 = run_cli(str(self.web), "--install-hook")
+        self.assertEqual(r3.returncode, 1)
+        self.assertIn("refusing", r3.stderr)
+
+    def test_install_hook_requires_git_repo(self):
+        r = run_cli(str(self.web), "--install-hook")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not a git repo", r.stderr)
+
+    def test_mcp_servers_extracted(self):
+        (self.web / ".mcp.json").write_text(json.dumps({
+            "mcpServers": {
+                "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]},
+                "github": {"command": "gh", "args": ["mcp"]},
+            }}), encoding="utf-8")
+        ev = agentize.analyze(self.web)
+        names = [s["name"] for s in ev.get("mcp", [])]
+        self.assertIn("playwright", names)
+        self.assertIn("github", names)
+        self.assertIn("npx", ev["mcp"][0]["cmd"])
+        md = agentize.render(ev)
+        self.assertIn("## MCP servers", md)
+        self.assertIn("playwright", md)
 
 
 class TestMonorepoWorkspaces(unittest.TestCase):
