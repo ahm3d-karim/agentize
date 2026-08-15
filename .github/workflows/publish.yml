@@ -1,0 +1,30 @@
+name: publish
+
+# Trusted publishing (OIDC) — no PyPI token exists anywhere.
+# The PyPI project must have this repo added as a trusted publisher:
+#   pypi.org → project → Publishing → Add publisher
+#   owner: ahm3d-karim · repository: agentize · workflow name: publish.yml
+# (workflow name must match THIS file's name exactly)
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: # manual test: proves OIDC auth even when version exists
+
+permissions:
+  id-token: write # required for trusted publishing — never write a token here
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build wheel + sdist
+        run: uv build
+      - name: Verify wheel contents (only agentize.py + dist-info)
+        run: python -m zipfile -l dist/*.whl | grep -E "agentize\.py|dist-info"
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
