@@ -441,8 +441,23 @@ class TestLlmPolish(unittest.TestCase):
     def test_polish_prompt_forbids_invention(self):
         prompt = agentize.build_polish_prompt({"name": "x", "commands": []})
         self.assertIn("Never invent", prompt)
-        self.assertIn("Evidence JSON", prompt)
+        self.assertIn("UNTRUSTED DATA", prompt)   # injection hardening
+        self.assertIn("<evidence>", prompt)        # delimited, not raw
+        self.assertIn("</evidence>", prompt)
         self.assertIn("REAL config files", prompt)
+
+    def test_sanitize_llm_output_strips_markdown(self):
+        # injection-resistant: headings, fences, links never reach AGENTS.md
+        self.assertEqual(
+            agentize.sanitize_llm_output("# Big heading\nplain prose\n```sh\nrm -rf /\n```\n[click](http://evil)"),
+            "plain prose")
+        self.assertEqual(agentize.sanitize_llm_output(""), "")
+        self.assertEqual(agentize.sanitize_llm_output("   "), "")
+        self.assertLessEqual(len(agentize.sanitize_llm_output("w " * 800)), 701)
+
+    def test_polish_unknown_provider_raises_clean(self):
+        with self.assertRaises(SystemExit):
+            agentize.polish({}, "bogus-provider", None, None)
 
     def test_render_prefers_ai_overview(self):
         ev = {"name": "x", "stack": {"languages": ["Python"], "frameworks": [],
