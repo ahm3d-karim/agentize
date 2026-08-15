@@ -309,6 +309,16 @@ class TestCheckMode(unittest.TestCase):
         r2 = run_cli(str(self.web), "--check", "--update")
         self.assertEqual(r2.returncode, 0)         # second pass: clean
 
+    def test_repeated_regeneration_never_accumulates_blank_lines(self):
+        for _ in range(3):
+            run_cli(str(self.web), "--force")
+        text = (self.web / "AGENTS.md").read_text(encoding="utf-8")
+        # file must end right after the end marker — no trailing blank lines
+        self.assertTrue(text.rstrip("\n").endswith(agentize.AGENTIZE_END),
+                        "regeneration accumulated trailing blank lines")
+        r = run_cli(str(self.web), "--check")
+        self.assertEqual(r.returncode, 0)
+
     def test_diff_shows_changes(self):
         run_cli(str(self.web))
         p = self.web / "AGENTS.md"

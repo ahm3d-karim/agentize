@@ -1848,8 +1848,11 @@ def update_agents_md(root: Path, md: str, extra: list[str] | None = None) -> int
         if block is not None:
             if block == expected_block:
                 continue
-            # expected_block already ends with \n (it came from md + "\n")
-            path.write_text(before + expected_block + after, encoding="utf-8")
+            # expected_block already ends with \n (it came from md + "\n");
+            # trailing blank lines after the block never accumulate
+            after = after.rstrip("\n")
+            tail = after + "\n" if after else ""
+            path.write_text(before + expected_block + tail, encoding="utf-8")
             print(f"agentize: {filename} updated")
             changed += 1
             continue
@@ -2018,8 +2021,11 @@ def _write_rendered(root: Path, md: str, args) -> int:
             before, block, after = _split_managed(
                 _normalize_newlines(path.read_text(encoding="utf-8")))
             if block is not None:
-                # preserve human notes above the start marker + below the end marker
-                content = before + _normalize_newlines(content) + "\n" + after
+                # preserve human notes above the start marker + below the end
+                # marker; trailing blank lines after the block never accumulate
+                after = after.rstrip("\n")
+                tail = after + "\n" if after else ""
+                content = before + _normalize_newlines(content) + tail
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         print(ok(f"agentize: wrote {path}"))
