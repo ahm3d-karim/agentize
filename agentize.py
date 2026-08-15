@@ -406,7 +406,7 @@ def extract_makefile(root: Path) -> list[dict]:
     text = read_small(p) or ""
     out = []
     seen = set()
-    for m in re.finditer(r"^([a-zA-Z0-9_.-]+)\s*:", text, re.MULTILINE):
+    for m in re.finditer(r"^([a-zA-Z0-9_.-]+)\s*:\s*(?!=)", text, re.MULTILINE):
         target = m.group(1)
         if target in seen or target in ("PHONY", "all", "help"):
             continue

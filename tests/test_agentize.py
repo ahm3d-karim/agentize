@@ -699,5 +699,25 @@ class TestHistoryAndBootstrap(unittest.TestCase):
             builtins.input = old_input
 
 
+class TestMakefileExtraction(unittest.TestCase):
+    """Makefile parsing: `:=` variable assignments are NOT targets."""
+
+    def _makefile(self, text):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "Makefile").write_text(text, encoding="utf-8")
+        return d
+
+    def test_assignments_not_targets(self):
+        # `CC := gcc` / `CFLAGS := -O2` are variable assignments, not targets
+        d = self._makefile("CC := gcc\nCFLAGS := -O2\n")
+        self.assertEqual(agentize.extract_makefile(d), [])
+
+    def test_real_targets_still_found(self):
+        d = self._makefile("CC := gcc\nbuild: main.c\n\ttest -f main.c\n")
+        cmds = agentize.extract_makefile(d)
+        self.assertEqual([c["cmd"] for c in cmds], ["make build"])
+
+
 if __name__ == "__main__":
     unittest.main()
