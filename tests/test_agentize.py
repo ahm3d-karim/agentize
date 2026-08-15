@@ -719,5 +719,29 @@ class TestMakefileExtraction(unittest.TestCase):
         self.assertEqual([c["cmd"] for c in cmds], ["make build"])
 
 
+class TestStructureMap(unittest.TestCase):
+    """structure_map buckets files by top-level segment — one pass, no O(n²)."""
+
+    def test_counts_per_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            for sub, n in (("src", 4), ("tests", 2)):
+                (root / sub).mkdir()
+                for i in range(n):
+                    (root / sub / f"f{i}.py").write_text("x")
+            rows = dict(agentize.structure_map(root, agentize.walk_repo(root)))
+            self.assertEqual(rows.get("src/"), "source code (4 files)")
+            self.assertEqual(rows.get("tests/"), "tests (2 files)")
+
+    def test_many_files_counted_correctly(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            (root / "lib").mkdir()
+            for i in range(300):
+                (root / "lib" / f"m{i}.py").write_text("x")
+            rows = dict(agentize.structure_map(root, agentize.walk_repo(root)))
+            self.assertEqual(rows.get("lib/"), "shared libraries/utilities (300 files)")
+
+
 if __name__ == "__main__":
     unittest.main()

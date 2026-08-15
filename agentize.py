@@ -538,7 +538,7 @@ def structure_map(root: Path, files: list[Path]) -> list[tuple[str, str]]:
         "Dockerfile": "container build", ".env.example": "env template",
     }
     rows: list[tuple[str, str]] = []
-    seen_dirs = set()
+    counts: dict[str, int] = {}
     for f in files:
         r = rel(root, f)
         parts = r.split("/")
@@ -546,11 +546,13 @@ def structure_map(root: Path, files: list[Path]) -> list[tuple[str, str]]:
             role = FILE_ROLES.get(f.name)
             if role:
                 rows.append((f.name, role))
-        elif len(parts) == 2 and parts[0] not in seen_dirs:
-            seen_dirs.add(parts[0])
-            role = DIR_ROLES.get(parts[0], "—")
-            n = sum(1 for g in files if rel(root, g).startswith(parts[0] + "/"))
-            rows.append((parts[0] + "/", f"{role} ({n} files)"))
+        else:
+            # one pass: bucket by first path segment, count as we go
+            top = parts[0]
+            counts[top] = counts.get(top, 0) + 1
+    for d, n in counts.items():
+        role = DIR_ROLES.get(d, "—")
+        rows.append((d + "/", f"{role} ({n} files)"))
     # drop agent-instruction files from the map — they're the output, not input
     rows = [(n, r) for n, r in rows if n not in ("AGENTS.md", "CLAUDE.md", ".cursorrules")]
     return rows[:22]
