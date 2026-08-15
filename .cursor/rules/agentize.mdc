@@ -10,6 +10,12 @@ globs: "**/*"
 alwaysApply: true
 ---
 
+---
+description: agentize
+globs: "**/*"
+alwaysApply: true
+---
+
 <!-- agentize:start -->
 # agentize
 

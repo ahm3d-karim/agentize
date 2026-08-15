@@ -1848,10 +1848,11 @@ def update_agents_md(root: Path, md: str, extra: list[str] | None = None) -> int
         if block is not None:
             if block == expected_block:
                 continue
-            # expected_block already ends with \n (it came from md + "\n");
-            # trailing blank lines after the block never accumulate
+            # expected_block (from _split_managed) has no trailing newline —
+            # a fresh render does; trailing blanks after the block never
+            # accumulate, but the file must still end with exactly one \n
             after = after.rstrip("\n")
-            tail = after + "\n" if after else ""
+            tail = after + "\n" if after else "\n"
             path.write_text(before + expected_block + tail, encoding="utf-8")
             print(f"agentize: {filename} updated")
             changed += 1
